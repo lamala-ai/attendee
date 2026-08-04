@@ -1349,13 +1349,11 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
         if not url_is_allowed_for_voice_agent(screenshare_url):
             raise serializers.ValidationError({"screenshare_url": "URL is not allowed for voice agent. Please set the VOICE_AGENT_URL_PREFIX_ALLOWLIST environment variable to the comma-separated list of allowed URL prefixes."})
 
-        if value.get("reserve_resources"):
-            meeting_url = self.initial_data.get("meeting_url")
-            meeting_type = meeting_type_from_url(meeting_url)
-            use_zoom_web_adapter = self.initial_data.get("zoom_settings", {}).get("sdk", "native") == "web"
-
-            if meeting_type == MeetingTypes.ZOOM and not use_zoom_web_adapter:
-                raise serializers.ValidationError("Voice agent is not supported for Zoom when using the native SDK. Please set 'zoom_settings.sdk' to 'web' in the bot creation request.")
+        # Zoom on the native SDK was rejected here, because every webpage streaming hook
+        # on that adapter was a no-op. They are implemented now: the bot receives the
+        # streamer's WebRTC track itself and forwards frames through Zoom's external
+        # share source, so a native bot shares a page the way a browser bot does. See
+        # bots/zoom_bot_adapter/webpage_streamer_share_source.py.
 
         return value
 

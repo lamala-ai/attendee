@@ -16,6 +16,7 @@ from bots.utils import image_to_yuv420_frame, scale_i420, select_from_comma_sepa
 from .mp4_demuxer import MP4Demuxer
 from .realtime_per_participant_video_frame_generator import RealtimePerParticipantVideoFrameGenerator
 from .video_input_manager import VideoInputManager
+from .webpage_streamer_share_source import WebpageStreamerShareSource
 
 gi.require_version("GLib", "2.0")
 import logging
@@ -139,6 +140,9 @@ class ZoomBotAdapter(BotAdapter):
         self.video_source_helper = None
         self.video_frame_size = video_frame_size
         self.send_image_timeout_id = None
+        # Built lazily: most bots are never asked to show anything, and it costs an
+        # asyncio thread and a peer connection.
+        self.webpage_streamer_share_source = None
 
         self.automatic_leave_configuration = automatic_leave_configuration
 
@@ -415,6 +419,12 @@ class ZoomBotAdapter(BotAdapter):
         self.set_video_input_manager_based_on_state()
 
     def cleanup(self):
+        # First, so the share stops and its thread unwinds while the meeting service is
+        # still alive to accept the call.
+        if self.webpage_streamer_share_source:
+            self.webpage_streamer_share_source.cleanup()
+            self.webpage_streamer_share_source = None
+
         if self.audio_source:
             performance_data = self.audio_source.getPerformanceData()
             logger.info(f"totalProcessingTimeMicroseconds = {performance_data.totalProcessingTimeMicroseconds}")
@@ -1285,18 +1295,36 @@ class ZoomBotAdapter(BotAdapter):
     def get_staged_bot_join_delay_seconds(self):
         return 0
 
-    # These webpage streaming functionality is not available for the zoom native adapter
+    # Webpage streaming. The web adapters hand these straight to their browser, which
+    # owns the peer connection; a native bot has no browser, so the connection is
+    # received here and the frames go out over Zoom's external share source. See
+    # webpage_streamer_share_source.py - and note that everything the SDK touches stays
+    # on this thread, because the sole shared object with the aiortc thread is a frame
+    # buffer.
+    def _webpage_streamer_share_source(self):
+        if self.webpage_streamer_share_source is None:
+            self.webpage_streamer_share_source = WebpageStreamerShareSource(
+                meeting_service=self.meeting_service,
+                schedule_on_main_thread=GLib.timeout_add,
+                unschedule_on_main_thread=GLib.source_remove,
+            )
+        return self.webpage_streamer_share_source
+
     def webpage_streamer_get_peer_connection_offer(self):
-        pass
+        return self._webpage_streamer_share_source().get_peer_connection_offer()
 
     def webpage_streamer_start_peer_connection(self, offer_response):
-        pass
+        return self._webpage_streamer_share_source().start_peer_connection(offer_response)
 
     def webpage_streamer_play_bot_output_media_stream(self, output_destination):
-        pass
+        return self._webpage_streamer_share_source().play_bot_output_media_stream(output_destination)
 
-    def webpage_streamer_stop_bot_output_media_stream(self, output_destination):
-        pass
+    def webpage_streamer_stop_bot_output_media_stream(self, output_destination=None):
+        if self.webpage_streamer_share_source is None:
+            return
+        return self.webpage_streamer_share_source.stop_bot_output_media_stream(output_destination)
 
     def is_bot_ready_for_webpage_streamer(self):
-        pass
+        # The share source cannot be registered before the bot is actually in the
+        # meeting, and the streamer must not be told to connect until it can be.
+        return bool(self.meeting_service) and self.my_participant_id is not None and not self.requested_leave
