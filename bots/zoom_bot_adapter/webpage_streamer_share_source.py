@@ -271,9 +271,17 @@ class WebpageStreamerShareSource:
             self._pump_timeout_id = self._schedule(SHARE_FRAME_INTERVAL_MS, self._pump_frame)
 
     def on_share_stop_send_callback(self):
+        """Zoom telling us the share is over - which settles it, whoever ended it.
+
+        It fires both when we stop the share ourselves and when it is ended out from
+        under us, the ordinary case being the meeting finishing. Clearing
+        ``_sharing_started`` here is what stops teardown then asking Zoom to stop a share
+        that has already stopped, which it answers with SDKERR_WRONG_USAGE.
+        """
         logger.info("on_share_stop_send_callback called")
         self._stop_pump()
         self.share_sender = None
+        self._sharing_started = False
 
     def on_share_start_send_audio_callback(self, audio_sender):
         """Required by the SDK, deliberately silent. See the note in
@@ -329,7 +337,16 @@ class WebpageStreamerShareSource:
                 # room seeing anything - which is the actual goal. The sender is
                 # invalidated by the onStopSend callback that follows.
                 result = self.meeting_service.GetMeetingShareController().StopShare()
-                logger.info(f"StopShare result = {result}")
+                if result == zoom.SDKERR_WRONG_USAGE:
+                    # "Stops the current sharing" with no current sharing to stop. The
+                    # race is ordinary rather than exceptional - the meeting ending stops
+                    # the share and tears the bot down at nearly the same moment - and
+                    # the outcome wanted here is the one already true.
+                    logger.info("StopShare: there was no share left to stop")
+                elif result != zoom.SDKERR_SUCCESS:
+                    logger.info(f"StopShare did not succeed, result = {result}")
+                else:
+                    logger.info("StopShare result = SDKERR_SUCCESS")
             except Exception:
                 logger.exception("Failed to stop sharing the page")
         self._sharing_started = False
