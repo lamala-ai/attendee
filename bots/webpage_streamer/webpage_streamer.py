@@ -162,44 +162,91 @@ class WebpageStreamer:
         self._video_track = None
         self._audio_track = None
 
-    def _start_gstreamer_capture(self):
-        if self._gst_pipeline:
-            return
-
-        width, height = self.video_frame_size
-        display_var = self.display_var_for_recording
-
-        pipeline_desc = f"""
+    def _video_branch(self, width, height, display_var):
+        return f"""
             ximagesrc display-name={display_var} use-damage=0 show-pointer=false
                 ! video/x-raw,framerate=15/1,width={width},height={height}
                 ! videoconvert
                 ! video/x-raw,format=I420,width={width},height={height}
                 ! queue max-size-buffers=5 max-size-time=0 leaky=downstream
                 ! appsink name=video_sink emit-signals=false max-buffers=1 drop=true
+        """
 
+    AUDIO_BRANCH = """
             alsasrc device=default
                 ! audio/x-raw,format=S16LE,channels=1,rate=16000
                 ! audioconvert
                 ! audioresample
                 ! queue max-size-buffers=8000 leaky=downstream
                 ! appsink name=audio_sink emit-signals=false max-buffers=8000 drop=true
+    """
+
+    @staticmethod
+    def _bus_error(pipeline):
+        """Whatever GStreamer actually objected to, as a sentence.
+
+        Worth the detour: a failed state change reports only that it failed, and the
+        element that refused - a missing sound card, an X display that is not there -
+        says so on the bus and nowhere else. Without this the log reads "Failed to
+        start GStreamer pipeline" no matter which half of it is at fault.
         """
+        message = pipeline.get_bus().timed_pop_filtered(0, Gst.MessageType.ERROR)
+        if message is None:
+            return ""
+        error, debug = message.parse_error()
+        return f"{error.message} [{debug}]"
+
+    def _try_pipeline(self, description, with_audio):
+        """Bring one pipeline up, or return the reason it would not come up."""
+        pipeline = Gst.parse_launch(description)
+        video_sink = pipeline.get_by_name("video_sink")
+        audio_sink = pipeline.get_by_name("audio_sink") if with_audio else None
+        if video_sink is None or (with_audio and audio_sink is None):
+            pipeline.set_state(Gst.State.NULL)
+            return None, None, None, "could not find the appsinks"
+
+        if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            reason = self._bus_error(pipeline) or "state change refused"
+            pipeline.set_state(Gst.State.NULL)
+            return None, None, None, reason
+
+        # PLAYING is usually reached asynchronously, so a source that cannot open its
+        # device answers here rather than above. Without this wait the pipeline looks
+        # started and then quietly produces nothing.
+        changed, _state, _pending = pipeline.get_state(5 * Gst.SECOND)
+        if changed != Gst.StateChangeReturn.SUCCESS:
+            reason = self._bus_error(pipeline) or "did not reach PLAYING"
+            pipeline.set_state(Gst.State.NULL)
+            return None, None, None, reason
+
+        return pipeline, video_sink, audio_sink, ""
+
+    def _start_gstreamer_capture(self):
+        if self._gst_pipeline:
+            return
+
+        width, height = self.video_frame_size
+        display_var = self.display_var_for_recording
+        video = self._video_branch(width, height, display_var)
 
         logger.info("Starting GStreamer capture pipeline")
-        self._gst_pipeline = Gst.parse_launch(pipeline_desc)
+        pipeline, video_sink, audio_sink, reason = self._try_pipeline(video + self.AUDIO_BRANCH, True)
 
-        self._gst_video_sink = self._gst_pipeline.get_by_name("video_sink")
-        self._gst_audio_sink = self._gst_pipeline.get_by_name("audio_sink")
+        if pipeline is None:
+            # The audio branch is the fragile half - alsasrc needs a sound card, and a
+            # container often has none. Losing it costs nothing here: what is being
+            # shared is a web page, and the screenshare track carries no audio anyway.
+            # Losing the video is the whole feature, so it is worth going on without.
+            logger.warning(f"GStreamer pipeline with audio would not start ({reason}) - capturing video only")
+            pipeline, video_sink, audio_sink, reason = self._try_pipeline(video, False)
 
-        if not self._gst_video_sink or not self._gst_audio_sink:
-            raise RuntimeError("Failed to get GStreamer appsinks for audio/video")
+        if pipeline is None:
+            raise RuntimeError(f"Failed to start GStreamer pipeline: {reason}")
 
-        ret = self._gst_pipeline.set_state(Gst.State.PLAYING)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            self._gst_pipeline.set_state(Gst.State.NULL)
-            raise RuntimeError("Failed to start GStreamer pipeline")
-
-        logger.info("GStreamer capture pipeline is PLAYING")
+        self._gst_pipeline = pipeline
+        self._gst_video_sink = video_sink
+        self._gst_audio_sink = audio_sink
+        logger.info(f"GStreamer capture pipeline is PLAYING ({'video and audio' if audio_sink else 'video only'})")
 
         self._video_track = GstVideoStreamTrack(
             sink=self._gst_video_sink,
@@ -207,10 +254,10 @@ class WebpageStreamer:
             height=height,
             framerate=15,
         )
-        self._audio_track = GstAudioStreamTrack(
-            sink=self._gst_audio_sink,
-            sample_rate=16000,
-            channels=1,
+        self._audio_track = (
+            GstAudioStreamTrack(sink=self._gst_audio_sink, sample_rate=16000, channels=1)
+            if self._gst_audio_sink
+            else None
         )
 
     def _stop_gstreamer_capture(self):

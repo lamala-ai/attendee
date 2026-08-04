@@ -117,7 +117,13 @@ class WebpageStreamerManager:
             logger.error(f"Error getting peer connection offer: {peerConnectionOffer.get('error')}, returning")
             return
 
-        offer_response = requests.post(f"http://{self.streaming_service_hostname()}:8000/offer", json={"sdp": peerConnectionOffer["sdp"], "type": peerConnectionOffer["type"]})
+        offer_response = requests.post(f"http://{self.streaming_service_hostname()}:8000/offer", json={"sdp": peerConnectionOffer["sdp"], "type": peerConnectionOffer["type"]}, timeout=30)
+        # Checked before parsing: the streamer answers a failed offer with a 500 whose
+        # body is a plain traceback, so calling .json() on it raises a JSONDecodeError
+        # that buries the actual error under a parsing one.
+        if offer_response.status_code != 200:
+            logger.error(f"Webpage streamer refused the offer: {offer_response.status_code} {offer_response.text[:500]}")
+            return
         logger.info(f"Offer response: {offer_response.json()}")
         self.start_peer_connection_callback(offer_response.json())
 
