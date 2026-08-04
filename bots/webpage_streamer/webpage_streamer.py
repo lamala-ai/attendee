@@ -471,4 +471,14 @@ class WebpageStreamer:
         app.router.add_post("/offer_meeting_audio", offer_meeting_audio)  # SDP exchange
         app.router.add_options("/offer_meeting_audio", handle_cors_preflight)
 
-        web.run_app(app, host="0.0.0.0", port=port)
+        # "0.0.0.0" is every IPv4 interface and no IPv6 one. That is fine under docker
+        # compose and wrong anywhere the private network is IPv6: on Railway a bot
+        # dialling <service>.railway.internal:8000 finds nothing listening, and because
+        # the keepalive POST that would discover this has no timeout, it hangs instead of
+        # failing - no error, no log line, and a share that never starts.
+        #
+        # None binds every interface of every family the host actually has, which covers
+        # IPv6 without assuming it exists. Overridable for a deployment that must pin one.
+        host = os.getenv("WEBPAGE_STREAMER_BIND_HOST") or None
+        logger.info(f"Webpage streamer binding to {host or 'all interfaces'}:{port}")
+        web.run_app(app, host=host, port=port)

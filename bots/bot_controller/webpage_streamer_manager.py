@@ -142,7 +142,12 @@ class WebpageStreamerManager:
                 if self.cleaned_up:
                     break
 
-                response = requests.post(f"http://{self.streaming_service_hostname()}:8000/keepalive", json={})
+                # Timeout, because this request is also the reachability check. Without
+                # one, a streamer that resolves but is not listening - a wrong hostname,
+                # an address family it does not bind - hangs this thread on its first
+                # call for ever. That is indistinguishable from a healthy quiet loop:
+                # no keepalive line, no error line, and a share that never starts.
+                response = requests.post(f"http://{self.streaming_service_hostname()}:8000/keepalive", json={}, timeout=10)
                 logger.info(f"Webpage streamer keepalive response: {response.status_code}")
                 if response.status_code == 200 and not self.webpage_streamer_connection_can_start:
                     bot_is_ready_for_webpage_streamer = self.is_bot_ready_for_webpage_streamer_callback()
