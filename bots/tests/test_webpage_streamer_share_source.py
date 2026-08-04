@@ -25,6 +25,7 @@ from django.test import SimpleTestCase
 from bots.zoom_bot_adapter.webpage_streamer_share_source import WebpageStreamerShareSource
 
 SDKERR_SUCCESS = 0
+SDKERR_WRONG_USAGE = 7
 
 
 class FakeShareSourceHelper:
@@ -56,6 +57,7 @@ def create_mock_zoom_sdk_for_sharing(helper):
         mock.ShareSourceCallbacks = MockShareSourceCallbacks
         mock.ShareAudioCallbacks = MockShareAudioCallbacks
         mock.SDKERR_SUCCESS = SDKERR_SUCCESS
+        mock.SDKERR_WRONG_USAGE = SDKERR_WRONG_USAGE
         mock.GetRawdataShareSourceHelper = MagicMock(return_value=helper)
         return mock
 
@@ -139,6 +141,7 @@ class TestStoppingTheShare(WebpageStreamerShareSourceTestCase):
         binding: both arguments are mandatory, and no binding in this module declares
         ``nb::arg().none()``, so None is refused too. ``StopShare`` takes no arguments
         and is what the SDK documents for ending a share."""
+        self.meeting_service.GetMeetingShareController.return_value.StopShare.return_value = SDKERR_SUCCESS
         with self.zoom_patch():
             self.share_source.play_bot_output_media_stream("screenshare")
             self.share_source.stop_bot_output_media_stream()
@@ -154,3 +157,34 @@ class TestStoppingTheShare(WebpageStreamerShareSourceTestCase):
             self.share_source.stop_bot_output_media_stream()
 
         self.meeting_service.GetMeetingShareController.assert_not_called()
+
+    def test_a_share_zoom_already_ended_is_not_stopped_again(self):
+        """Observed as `StopShare result = SDKError.SDKERR_WRONG_USAGE` at the end of a
+        real meeting. The meeting finishing stops the share and tears the bot down at
+        nearly the same moment, so teardown was asking Zoom to stop something that had
+        already stopped. onStopSend is Zoom telling us it is over, whoever ended it, and
+        that settles it.
+
+        Fails against the old behaviour, where the callback left _sharing_started set.
+        """
+        with self.zoom_patch():
+            self.share_source.play_bot_output_media_stream("screenshare")
+            self.share_source.on_share_stop_send_callback()  # the meeting ended
+            self.share_source.stop_bot_output_media_stream()
+
+        self.assertFalse(self.share_source._sharing_started)
+        self.meeting_service.GetMeetingShareController.assert_not_called()
+
+    def test_wrong_usage_from_stop_share_is_not_reported_as_a_failure(self):
+        """It means "there was no current sharing", which is the state being asked for."""
+        controller = self.meeting_service.GetMeetingShareController.return_value
+        with self.zoom_patch() as mock_zoom:
+            controller.StopShare.return_value = SDKERR_WRONG_USAGE
+            self.share_source.play_bot_output_media_stream("screenshare")
+            with self.assertLogs(
+                "bots.zoom_bot_adapter.webpage_streamer_share_source", level="INFO"
+            ) as logs:
+                self.share_source.stop_bot_output_media_stream()
+
+        self.assertTrue(any("no share left to stop" in line for line in logs.output))
+        self.assertFalse(self.share_source._sharing_started)

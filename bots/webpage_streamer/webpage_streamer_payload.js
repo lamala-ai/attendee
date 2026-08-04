@@ -7,26 +7,30 @@
   let pc = null;
   let virtualAudioTrack = null;
   let virtualMicPromise = null;
+  // Set once the streamer has told us there is no meeting audio to hand out. That is a
+  // deployment fact, not a transient failure, so it is remembered: without this every
+  // getUserMedia call opens another peer connection and waits the full timeout again.
+  let upstreamAudioUnavailable = false;
 
-  function showErrorOnDom(errorMsg) {
-    const errorDiv = document.createElement('div');
-    errorDiv.id = 'attendee-audio-error';
-    errorDiv.textContent = errorMsg;
-    Object.assign(errorDiv.style, {
-      position: 'fixed',
-      top: '20px',
-      left: '50%',
-      transform: 'translateX(-50%)',
-      background: '#d32f2f',
-      color: 'white',
-      padding: '12px 24px',
-      borderRadius: '4px',
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '14px',
-      zIndex: '999999',
-      boxShadow: '0 2px 8px rgba(0,0,0,0.3)'
-    });
-    document.body.appendChild(errorDiv);
+  // Reported to the console, never to the page.
+  //
+  // This used to append a fixed, centred, z-index 999999 red banner to document.body -
+  // in a page belonging to whoever asked for the screenshare, which is then on a screen
+  // in front of a room of people. A deployment that streams pages but never publishes
+  // meeting audio (a slide, a dashboard, anything that does not need to hear the call)
+  // fails this path every single time, so the banner was not an edge case there: it was
+  // stamped across the top of every page shared, over the title.
+  //
+  // Nobody in that room can act on it, it is not about what they are reading, and the
+  // page is the entire product. Whoever operates the streamer reads logs; the people
+  // looking at the screen do not.
+  function reportAudioIssue(message, level) {
+    const line = "[attendee webpage streamer] " + message;
+    if (level === "info") {
+      console.info(line);
+    } else {
+      console.error(line);
+    }
   }
 
   async function ensureVirtualMicTrack() {
@@ -35,6 +39,11 @@
     }
     if (virtualMicPromise) {
       return virtualMicPromise;
+    }
+    if (upstreamAudioUnavailable) {
+      // Already asked, already told no. Fail immediately rather than spending another
+      // peer connection and another ten seconds arriving at the same answer.
+      throw new Error("No meeting audio is published to this streamer");
     }
 
     virtualMicPromise = (async () => {
@@ -51,7 +60,7 @@
           if (!resolved) {
             resolved = true;
             const errorMsg = 'Failed to receive remote audio stream within 10 seconds';
-            showErrorOnDom(errorMsg);
+            reportAudioIssue(errorMsg);
             reject(new Error(errorMsg));
           }
         }, 10000); // 10 second timeout
@@ -84,7 +93,22 @@
         if (!res.ok) {
           const t = await res.text().catch(() => "");
           const errorMsg = "Upstream audio error: " + res.status + (t ? " " + t : "");
-          showErrorOnDom(errorMsg);
+          if (res.status === 409) {
+            // 409 is the streamer saying nobody has published meeting audio. In a
+            // deployment that only ever streams pages, that is the permanent, correct
+            // answer rather than a fault - so it is noted once, at info, and not asked
+            // again.
+            upstreamAudioUnavailable = true;
+            clearTimeout(timeout);
+            reportAudioIssue(
+              "no meeting audio is published to this streamer, so pages will not be " +
+                "given a virtual microphone",
+              "info"
+            );
+          } else {
+            reportAudioIssue(errorMsg);
+          }
+          resolved = true;
           reject(new Error(errorMsg));
           return;
         }
@@ -108,6 +132,17 @@
     } catch (e) {
       console.error("Failed to set up virtual mic:", e);
       virtualMicPromise = null;
+      // The connection that was being negotiated is finished with either way. Left open
+      // it accumulates one per attempt, and a page that keeps asking for a microphone
+      // used to get one attempt per call.
+      if (pc) {
+        try {
+          pc.close();
+        } catch (closeError) {
+          /* already gone */
+        }
+        pc = null;
+      }
       throw e;
     }
   }
