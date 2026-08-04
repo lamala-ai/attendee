@@ -104,6 +104,9 @@ class WebpageStreamerShareSource:
         # --- the Zoom side, all touched only from the adapter's GLib thread ---
         self.share_source_helper = None
         self.share_source_callbacks = None
+        # Held for the lifetime of the share even though it does nothing: the SDK keeps
+        # a raw pointer to it, so letting it be collected would leave a dangling one.
+        self.share_audio_callbacks = None
         self.share_sender = None
         self._pump_timeout_id = None
         self._sharing_started = False
@@ -238,9 +241,22 @@ class WebpageStreamerShareSource:
             onStartSendCallback=self.on_share_start_send_callback,
             onStopSendCallback=self.on_share_stop_send_callback,
         )
-        # Share audio is deliberately not supplied: sendShareAudio rejects every
-        # documented format on Linux, and a page we render has nothing to play anyway.
-        result = self.share_source_helper.setExternalShareSource(self.share_source_callbacks)
+        # We still have no share audio to send - sendShareAudio rejects every documented
+        # format on Linux, and a page we render has nothing to play. But declining it by
+        # *omitting the argument* does not work: the C++ default (pAudioSource = nullptr)
+        # is lost in the binding, which is a bare .def() with no nb::arg(...) = nullptr,
+        # so both parameters are required in Python and the one-argument call raised
+        #     TypeError: setExternalShareSource(): incompatible function arguments
+        # at the last step before Zoom would have seen a frame. Nothing upstream of it
+        # failed, and nothing downstream ever ran. So the way to decline share audio is
+        # to hand over a source whose callbacks do nothing, which is what this is.
+        self.share_audio_callbacks = zoom.ShareAudioCallbacks(
+            onStartSendAudioCallback=self.on_share_start_send_audio_callback,
+            onStopSendAudioCallback=self.on_share_stop_send_audio_callback,
+        )
+        result = self.share_source_helper.setExternalShareSource(
+            self.share_source_callbacks, self.share_audio_callbacks
+        )
         logger.info(f"setExternalShareSource result = {result}")
         if result != zoom.SDKERR_SUCCESS:
             logger.info("Failed to set the external share source, the room will not see the page")
@@ -258,6 +274,15 @@ class WebpageStreamerShareSource:
         logger.info("on_share_stop_send_callback called")
         self._stop_pump()
         self.share_sender = None
+
+    def on_share_start_send_audio_callback(self, audio_sender):
+        """Required by the SDK, deliberately silent. See the note in
+        ``play_bot_output_media_stream``: we register an audio source only because the
+        binding makes the argument mandatory, and we never send through it."""
+        logger.info("on_share_start_send_audio_callback called - no audio will be sent")
+
+    def on_share_stop_send_audio_callback(self):
+        logger.info("on_share_stop_send_audio_callback called")
 
     def _pump_frame(self):
         """Send the newest frame to Zoom. Runs on the adapter's GLib thread.
@@ -293,13 +318,20 @@ class WebpageStreamerShareSource:
     def stop_bot_output_media_stream(self, output_destination=None):
         self._stop_pump()
         self.latest_frame.clear()
-        if self._sharing_started and self.share_source_helper:
+        if self._sharing_started and self.meeting_service:
             try:
-                # An empty external source is how the helper is told to stop; the
-                # sender becomes invalid immediately afterwards.
-                self.share_source_helper.setExternalShareSource(None)
+                # StopShare on the share controller, not setExternalShareSource(None).
+                # Clearing the source by passing a null one cannot be expressed through
+                # this binding at all: the arguments are mandatory (see
+                # play_bot_output_media_stream) and no binding in this module declares
+                # nb::arg().none(), so None is not accepted either. StopShare takes no
+                # arguments, is what the SDK documents for ending a share, and stops the
+                # room seeing anything - which is the actual goal. The sender is
+                # invalidated by the onStopSend callback that follows.
+                result = self.meeting_service.GetMeetingShareController().StopShare()
+                logger.info(f"StopShare result = {result}")
             except Exception:
-                logger.exception("Failed to clear the external share source")
+                logger.exception("Failed to stop sharing the page")
         self._sharing_started = False
         self.share_sender = None
 
