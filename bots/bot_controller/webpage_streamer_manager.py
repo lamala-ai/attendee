@@ -91,8 +91,11 @@ class WebpageStreamerManager:
         # If we're running in k8s, the streaming service will be on another pod which is addressable using via a per-pod service
         if os.getenv("LAUNCH_BOT_METHOD") == "kubernetes":
             return f"{self.webpage_streamer_service_hostname}"
-        # Otherwise the streaming service will be running in a separate docker compose service, so we address it using the service name
-        return "attendee-webpage-streamer-local"
+        # Otherwise the streaming service is a separate service addressed by name. That name is
+        # docker compose's on a compose deployment, but off compose the platform decides it -
+        # Railway, for one, answers private DNS only for "<service>.railway.internal" - so it is
+        # an environment variable defaulting to the compose name, which leaves compose unchanged.
+        return os.getenv("WEBPAGE_STREAMER_HOSTNAME", "attendee-webpage-streamer-local")
 
     def update_webrtc_connection(self, url):
         # Start and update do the same thing, so we can use the same endpoint
