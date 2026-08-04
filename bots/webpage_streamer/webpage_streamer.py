@@ -479,6 +479,9 @@ class WebpageStreamer:
         #
         # None binds every interface of every family the host actually has, which covers
         # IPv6 without assuming it exists. Overridable for a deployment that must pin one.
-        host = os.getenv("WEBPAGE_STREAMER_BIND_HOST") or None
-        logger.info(f"Webpage streamer binding to {host or 'all interfaces'}:{port}")
+        # "::" and not None: aiohttp turns None back into "0.0.0.0", so passing it looks
+        # like it binds everything and does not. Linux leaves bindv6only off, so a "::"
+        # socket accepts IPv4 through v4-mapped addresses and compose keeps working.
+        host = os.getenv("WEBPAGE_STREAMER_BIND_HOST") or "::"
+        logger.info(f"Webpage streamer binding to [{host}]:{port}")
         web.run_app(app, host=host, port=port)

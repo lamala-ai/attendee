@@ -165,8 +165,15 @@ class WebpageStreamerManager:
         logger.info("Webpage streamer keepalive task stopped")
 
     def send_webpage_streamer_shutdown_request(self):
+        # Shutting the streamer down is right when it is this bot's own - one streamer
+        # per pod, ending with the bot that owns it. It is destructive when the streamer
+        # is a service several bots share: the first bot to leave takes the renderer away
+        # from everyone still in a meeting, and the process does not come back on its own.
+        if os.getenv("WEBPAGE_STREAMER_IS_SHARED", "").strip().lower() in ("1", "true", "yes"):
+            logger.info("Not shutting the webpage streamer down: it is shared with other bots")
+            return
         try:
-            response = requests.post(f"http://{self.streaming_service_hostname()}:8000/shutdown", json={})
+            response = requests.post(f"http://{self.streaming_service_hostname()}:8000/shutdown", json={}, timeout=10)
             logger.info(f"Webpage streamer shutdown response: {response.json()}")
         except Exception as e:
             logger.info(f"Webpage streamer shutdown response: {e}")
