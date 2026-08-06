@@ -6,6 +6,7 @@ from selenium.webdriver.chrome.service import Service
 logger = logging.getLogger(__name__)
 
 import asyncio
+import contextlib
 import os
 import time
 from fractions import Fraction
@@ -25,6 +26,17 @@ from gi.repository import Gst, GstApp
 Gst.init(None)
 
 os.environ["PULSE_LATENCY_MSEC"] = "20"
+
+
+def streamer_is_shared():
+    """Is this process one bot's own streamer, or the fleet's?
+
+    Spelled out in `WebpageStreamerManager.send_webpage_streamer_shutdown_request` too,
+    rather than imported from it: that module is part of the Django app, and this one is
+    a standalone script that must not drag Django in to answer a question about an
+    environment variable.
+    """
+    return os.getenv("WEBPAGE_STREAMER_IS_SHARED", "").strip().lower() in ("1", "true", "yes")
 
 
 class GstVideoStreamTrack(MediaStreamTrack):
@@ -144,6 +156,13 @@ class GstAudioStreamTrack(MediaStreamTrack):
 
 
 class WebpageStreamer:
+    # How often the watchdog looks, and how long a session may go unspoken-for. Class
+    # attributes so a test can shrink them instead of waiting a quarter of an hour.
+    KEEPALIVE_CHECK_INTERVAL_SECONDS = 60
+    KEEPALIVE_TIMEOUT_SECONDS = 900
+
+    UPSTREAM_AUDIO_TRACK_KEY = "upstream_audio_track"
+
     def __init__(
         self,
         video_frame_size,
@@ -154,6 +173,17 @@ class WebpageStreamer:
         self.display = None
         self.last_keepalive_time = None
         self.web_app = None
+        # Read once, at construction: whether this process is disposable is a property of
+        # the deployment, and a test that flips the environment mid-run would be testing
+        # something that cannot happen.
+        self.is_shared = streamer_is_shared()
+        self._peer_connections = set()
+        self._browser_lock = asyncio.Lock()
+        self._keepalive_task = None
+        # Holds the *original* upstream AudioStreamTrack from the first client that posts
+        # to /offer. The MediaRelay is necessary because it creates a small buffer.
+        # Without it audio quality is degraded.
+        self._upstream_audio_relay = MediaRelay()
 
         # GStreamer-related
         self._gst_pipeline = None
@@ -271,12 +301,30 @@ class WebpageStreamer:
             self._audio_track = None
 
     def run(self):
+        self._start_display()
+        self._start_browser()
+        self.load_webapp()
+
+    def _start_display(self):
+        if self.display is not None:
+            return
+
         self.display_var_for_recording = os.environ.get("DISPLAY")
         if os.environ.get("DISPLAY") is None:
             # Create virtual display only if no real display is available
             self.display = Display(visible=0, size=self.video_frame_size)
             self.display.start()
             self.display_var_for_recording = self.display.new_display_var
+
+    def _start_browser(self):
+        """Bring up Chrome, or leave the one that is already up alone.
+
+        Separate from `run` because a shared streamer gives Chrome back when it goes idle
+        and has to be able to take it again on the next request - the process outlives any
+        one browser.
+        """
+        if self.driver is not None:
+            return
 
         options = webdriver.ChromeOptions()
 
@@ -315,7 +363,11 @@ class WebpageStreamer:
         self.driver = webdriver.Chrome(options=options, service=Service(executable_path="/usr/local/bin/chromedriver"))
         logger.info(f"web driver server initialized at port {self.driver.service.port}")
 
-        with open("bots/webpage_streamer/webpage_streamer_payload.js", "r") as file:
+        # Beside this file rather than relative to the working directory: the browser is
+        # now started from a request handler as well as from startup, and a streamer that
+        # renders again only when launched from the repo root is a trap.
+        payload_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webpage_streamer_payload.js")
+        with open(payload_path, "r") as file:
             payload_code = file.read()
 
         combined_code = f"""
@@ -325,23 +377,100 @@ class WebpageStreamer:
         # Add the combined script to execute on new document
         self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": combined_code})
 
-        self.load_webapp()
+    def _stop_browser(self):
+        """Quit Chrome and forget it, so the next request starts a fresh one."""
+        driver, self.driver = self.driver, None
+        if driver is None:
+            return
+        try:
+            driver.quit()
+        except Exception as e:
+            # Whatever went wrong, the driver is not ours any more - keeping the handle
+            # would only mean handing a dead browser to the next request.
+            logger.warning(f"Error quitting the browser: {e}")
+
+    async def _ensure_browser(self):
+        """The browser a request needs, started if an idle release gave it back.
+
+        In the executor because starting Chrome takes seconds, and this now runs inside
+        the request handlers rather than before the server exists; under the lock because
+        two requests arriving together would otherwise start two of them and leak one.
+        """
+        async with self._browser_lock:
+            if self.driver is not None:
+                return
+            logger.info("No browser is running - starting one for this request")
+            await asyncio.get_running_loop().run_in_executor(None, self._start_browser)
+
+    def _holds_a_session(self):
+        return self.driver is not None or self._gst_pipeline is not None or bool(self._peer_connections)
 
     async def keepalive_monitor(self):
-        """Monitor keepalive status and shutdown if no keepalive received in the last 15 minutes."""
+        """Notice that nobody is using this streamer, and give back what it is holding.
+
+        What "give back" means is the whole point of the mode split. A per-bot streamer is
+        one bot's, spawned with it and respawned with the next one, so it exits and its
+        Chrome goes with it. A shared streamer is the fleet's only renderer and nothing
+        respawns it: an idle exit there ends every screenshare until somebody notices, and
+        it exits 0, so a platform restarting ON_FAILURE reads it as a job well done.
+
+        So the timer stays - the Chrome it reclaims is real, and a streamer that hangs on
+        to one browser per meeting it has ever rendered runs the box out of memory - but in
+        shared mode it reclaims the *session* and leaves the process serving.
+        """
 
         self.last_keepalive_time = time.time()
 
         while True:
-            await asyncio.sleep(60)  # Check every minute
+            await asyncio.sleep(self.KEEPALIVE_CHECK_INTERVAL_SECONDS)
 
             current_time = time.time()
             time_since_last_keepalive = current_time - self.last_keepalive_time
 
-            if time_since_last_keepalive > 900:  # More than 15 minutes since last keepalive
+            if time_since_last_keepalive <= self.KEEPALIVE_TIMEOUT_SECONDS:
+                continue
+
+            if not self.is_shared:
                 logger.warning(f"No keepalive received in {time_since_last_keepalive:.1f} seconds. Shutting down process.")
                 await self.shutdown_process()
                 break
+
+            if self._holds_a_session():
+                logger.warning(f"No keepalive received in {time_since_last_keepalive:.1f} seconds. Releasing the idle streaming session. This process is shared, so it stays up and keeps serving.")
+                await self.release_streaming_session()
+            # Restart the clock either way: the next release is another quarter of an hour
+            # of silence away, not one more tick of it.
+            self.last_keepalive_time = time.time()
+
+    async def release_streaming_session(self):
+        """Hand back everything a streaming session holds, and keep the port.
+
+        Chrome is the expensive half and the reason this exists - a wedged browser held
+        past its meeting is how the worker ended up at 7.99 GB of an 8 GB limit. The
+        pipeline and the peer connections go with it because a session that outlived its
+        renderer can only produce black frames.
+        """
+        await self._close_peer_connections()
+        self._stop_gstreamer_capture()
+        self._stop_browser()
+        logger.info("Idle streaming session released: browser, capture pipeline and peer connections are gone. Still listening for the next one.")
+
+    async def _close_peer_connections(self):
+        # Emptied in place rather than replaced: the request handlers hold this very set.
+        peer_connections = list(self._peer_connections)
+        self._peer_connections.clear()
+        for pc in peer_connections:
+            try:
+                await pc.close()
+            except Exception as e:
+                logger.warning(f"Error closing a peer connection: {e}")
+
+        if self.web_app is not None:
+            # The upstream track belonged to a connection that is now closed, and the relay
+            # buffers what it was carrying. Both are replaced rather than reused, or the
+            # next session rebroadcasts a track nobody is feeding.
+            self.web_app.pop(self.UPSTREAM_AUDIO_TRACK_KEY, None)
+        self._upstream_audio_relay = MediaRelay()
 
     async def shutdown_process(self):
         """Gracefully shutdown the process."""
@@ -359,14 +488,12 @@ class WebpageStreamer:
         finally:
             os._exit(0)
 
-    def load_webapp(self):
-        pcs = set()
-
-        # will hold the *original* upstream AudioStreamTrack
-        # from the first client that posts to /offer
-        # The MediaRelay is necessary because it creates a small buffer. Without it audio quality is degraded.
-        UPSTREAM_AUDIO_RELAY = MediaRelay()
-        UPSTREAM_AUDIO_TRACK_KEY = "upstream_audio_track"
+    def build_web_app(self):
+        # The peer connections and the relay live on the streamer rather than in this
+        # closure, because an idle release has to be able to reach them from outside a
+        # request.
+        pcs = self._peer_connections
+        UPSTREAM_AUDIO_TRACK_KEY = self.UPSTREAM_AUDIO_TRACK_KEY
 
         async def offer_meeting_audio(req):
             """
@@ -386,7 +513,7 @@ class WebpageStreamer:
             pcs.add(pc)
 
             # Re-broadcast using the relay so multiple listeners are OK
-            rebroadcast_track = UPSTREAM_AUDIO_RELAY.subscribe(upstream)
+            rebroadcast_track = self._upstream_audio_relay.subscribe(upstream)
             pc.addTrack(rebroadcast_track)
 
             @pc.on("connectionstatechange")
@@ -403,6 +530,11 @@ class WebpageStreamer:
         async def offer(req):
             params = await req.json()
             offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+
+            # There is a browser to capture whenever this process was started, and there is
+            # not when a shared streamer released an idle session - the pipeline would
+            # capture an empty display and the room would get a blank share.
+            await self._ensure_browser()
 
             # Lazy-start capture so we don't accumulate latency before WebRTC is up
             if self._gst_pipeline is None:
@@ -445,7 +577,8 @@ class WebpageStreamer:
             if not webpage_url:
                 return web.json_response({"error": "URL is required"}, status=400)
 
-            print(f"Starting streaming to {webpage_url}")
+            logger.info(f"Starting streaming to {webpage_url}")
+            await self._ensure_browser()
             self.driver.get(webpage_url)
 
             return web.json_response({"status": "success"})
@@ -462,8 +595,6 @@ class WebpageStreamer:
             await self.shutdown_process()
             return web.json_response({"status": "success"})
 
-        port = 8000
-
         app = web.Application()
         self.web_app = app
 
@@ -471,10 +602,21 @@ class WebpageStreamer:
         async def init_keepalive_monitor(app):
             """Initialize keepalive monitoring when the app starts"""
             logger.info("Starting keepalive monitoring task")
-            asyncio.create_task(self.keepalive_monitor())
+            # Held, not fired and forgotten: asyncio keeps only a weak reference to a
+            # running task, and this one has to outlive every request.
+            self._keepalive_task = asyncio.create_task(self.keepalive_monitor())
             logger.info("Started keepalive monitoring task")
 
+        async def stop_keepalive_monitor(app):
+            task, self._keepalive_task = self._keepalive_task, None
+            if task is None:
+                return
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
         app.on_startup.append(init_keepalive_monitor)
+        app.on_cleanup.append(stop_keepalive_monitor)
 
         # Add CORS handling for preflight requests
         async def handle_cors_preflight(request):
@@ -517,6 +659,12 @@ class WebpageStreamer:
 
         app.router.add_post("/offer_meeting_audio", offer_meeting_audio)  # SDP exchange
         app.router.add_options("/offer_meeting_audio", handle_cors_preflight)
+
+        return app
+
+    def load_webapp(self):
+        app = self.build_web_app()
+        port = 8000
 
         # "0.0.0.0" is every IPv4 interface and no IPv6 one. That is fine under docker
         # compose and wrong anywhere the private network is IPv6: on Railway a bot
