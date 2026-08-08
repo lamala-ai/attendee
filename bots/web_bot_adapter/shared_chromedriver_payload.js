@@ -1,3 +1,9 @@
+// How long playBotOutputMediaStream waits for the streamer's video track before
+// giving up and saying so. Generous - the peer connection is still being negotiated
+// when the wait starts - but finite, because the failure it exists to surface looks
+// exactly like a stream that is still on its way.
+const BOT_OUTPUT_MEDIA_STREAM_WAIT_SECONDS = 30;
+
 // The bot's presence indicator, mirroring bots/presence_indicator.py so a tile looks
 // the same whichever adapter drew it. Change one, change the other.
 const PRESENCE_INDICATOR = {
@@ -534,17 +540,24 @@ class BotVideoOutputStream {
             this.videoElement.loop = false;
             this.videoElement.autoplay = true;
 
-            ///---- NOT SURE IF WE NEED THIS
+            // Unconditional: this is what builds the AudioContext and the gain node
+            // the mic runs through, and it is idempotent.
             this.createSourceAudioTrack();
 
-            // (Re)wire a MediaStreamAudioSourceNode from the stream into the same gainNode
-            if (this.mediaStreamAudioSource) {
-                this.mediaStreamAudioSource.disconnect();
+            // The wiring, though, only when the stream actually carries audio.
+            // createMediaStreamSource throws InvalidStateError on a stream with no
+            // audio tracks, and a screenshare of a web page is exactly that stream -
+            // doing this unconditionally sends the whole method into its catch and
+            // drops the video on the floor, which is not a failure the room can tell
+            // apart from having nothing to show.
+            if (mediaStream.getAudioTracks().length > 0) {
+                if (this.mediaStreamAudioSource) {
+                    this.mediaStreamAudioSource.disconnect();
+                }
+                this.mediaStreamAudioSource =
+                    this.getAudioContext().createMediaStreamSource(mediaStream);
+                this.mediaStreamAudioSource.connect(this.getGainNode());
             }
-            this.mediaStreamAudioSource =
-                this.getAudioContext().createMediaStreamSource(mediaStream);
-            this.mediaStreamAudioSource.connect(this.getGainNode());
-            ///----
 
             if (this.getAudioContext().state === "suspended") {
                 await this.getAudioContext().resume();
@@ -911,21 +924,42 @@ class BotOutputManager {
     }
 
     botOutputMediaStreamIsReady() {
-        return this.botOutputMediaStream.getVideoTracks().length > 0 && this.botOutputMediaStream.getAudioTracks().length > 0;
+        // Video alone is the whole requirement. Waiting for an audio track too meant
+        // a webpage streamer that offered video only - which is what it offers on any
+        // host without a sound card, since gstalsasrc cannot open one and the pipeline
+        // falls back to video-only by design - was never rendered at all: the interval
+        // below spun for the length of the meeting, nothing threw, every log line on
+        // the path read as success, and the room saw no screenshare in three
+        // consecutive calls. A shared web page has no audio to carry anyway.
+        return this.botOutputMediaStream.getVideoTracks().length > 0;
     }
 
     async playBotOutputMediaStream(outputDestination) {
         this.botOutputMediaStreamOutputDestination = outputDestination;
 
         if (!this.botOutputMediaStreamIsReady()) {
-            // Add interval to check if the bot output media stream is ready
-            
-            if (!this.botOutputMediaStreamIsReadyInterval)
+            // Add interval to check if the bot output media stream is ready.
+            // Bounded, and it says so when it gives up: an unbounded wait here is
+            // indistinguishable from a stream that is about to arrive, which is
+            // exactly how a share that never rendered went unnoticed for weeks.
+            if (!this.botOutputMediaStreamIsReadyInterval) {
+                let waited = 0;
                 this.botOutputMediaStreamIsReadyInterval = setInterval(() => {
                     if (this.botOutputMediaStreamIsReady()) {
                         this.playBotOutputMediaStream(this.botOutputMediaStreamOutputDestination);
+                        return;
+                    }
+                    if (++waited >= BOT_OUTPUT_MEDIA_STREAM_WAIT_SECONDS) {
+                        clearInterval(this.botOutputMediaStreamIsReadyInterval);
+                        this.botOutputMediaStreamIsReadyInterval = null;
+                        window.ws?.sendJson({
+                            type: 'BOT_OUTPUT_MEDIA_STREAM_NEVER_ARRIVED',
+                            outputDestination: this.botOutputMediaStreamOutputDestination,
+                            reason: `no video track arrived within ${waited}s`,
+                        });
                     }
                 }, 1000);
+            }
             return;
         }
 
