@@ -1,3 +1,18 @@
+// The bot's presence indicator, mirroring bots/presence_indicator.py so a tile looks
+// the same whichever adapter drew it. Change one, change the other.
+const PRESENCE_INDICATOR = {
+    listening: { color: "#75D87A", cycleSeconds: 2.8 },
+    working: { color: "#F6D795", cycleSeconds: 0.9 },
+};
+const PRESENCE_FRAME_INTERVAL_MS = 100;
+const PRESENCE_BEAD_RADIUS = 0.052;
+const PRESENCE_BEAD_INSET = 0.10;
+const PRESENCE_GLOW_RADIUS = 2.0;
+const PRESENCE_GLOW_ALPHA = 0.20;
+const PRESENCE_RIM_RADIUS = 1.14;
+const PRESENCE_RIM_ALPHA = 0.5;
+const PRESENCE_RIM_COLOR = "#14110D";
+
 // Holds the state of a bot video output stream. We need this class because there are two bot video output streams, one for webcam and one for screenshare.
 class BotVideoOutputStream {
     constructor({
@@ -28,6 +43,11 @@ class BotVideoOutputStream {
         this.imageRedrawInterval = null;
         this.imageToDraw = null;
         this.imageDrawParams = null;
+        // The mark drawn over the bot's avatar, and when it was last changed. See
+        // bots/presence_indicator.py - the colours, the periods and the geometry are
+        // that module's, repeated here so a tile looks the same on every platform.
+        this.presenceState = null;
+        this.presenceChangedAt = 0;
 
         this.canvasCtx.fillStyle = "black";
         this.canvasCtx.fillRect(0, 0, this.canvas.width, this.canvas.height);
@@ -78,12 +98,10 @@ class BotVideoOutputStream {
             this.canvas.height = this.canvasHeightForImage;
             this.imageDrawParams = this.calculateImageDrawParamsForLetterBoxing(this.imageToDraw.width, this.imageToDraw.height);
             this.canvasCtx.drawImage(this.imageToDraw, this.imageDrawParams.offsetX, this.imageDrawParams.offsetY, this.imageDrawParams.width, this.imageDrawParams.height);
+            this._drawPresenceIndicator();
             // Set up an interval that redraws the image every 1000ms. Needed to work in Teams.
-            if (!this.imageRedrawInterval) {
-                this.imageRedrawInterval = setInterval(() => {
-                    this.canvasCtx.drawImage(this.imageToDraw, this.imageDrawParams.offsetX, this.imageDrawParams.offsetY, this.imageDrawParams.width, this.imageDrawParams.height);
-                }, 1000);
-            }
+            // Ticks faster while a presence indicator is pulsing - see _redrawIntervalMs.
+            this._startImageRedrawInterval();
             this.ensureInputOn();
 
             // Capture last image bytes, so that we can display it again if we play a video
@@ -358,6 +376,97 @@ class BotVideoOutputStream {
             clearInterval(this.imageRedrawInterval);
             this.imageRedrawInterval = null;
         }
+    }
+
+    // --- the bot's own presence indicator ---------------------------------
+    //
+    // A bot sitting quietly in a meeting looks exactly like a bot whose process died,
+    // and sitting quietly is what it does for most of a call. So the tile carries a
+    // pulsing bead: slow while listening, faster while something is still owed, and
+    // nothing at all while it is speaking, when the room can hear it anyway.
+    //
+    // Nothing is sent per frame. The state is set once and the canvas - which is
+    // already captured as a video track - animates itself.
+
+    _presenceSettings() {
+        return PRESENCE_INDICATOR[this.presenceState] || null;
+    }
+
+    _redrawIntervalMs() {
+        // 1000ms is what a still needs to survive Teams; a pulse needs to be smooth.
+        return this._presenceSettings() ? PRESENCE_FRAME_INTERVAL_MS : 1000;
+    }
+
+    _startImageRedrawInterval() {
+        this._stopImageRedrawInterval();
+        this.imageRedrawInterval = setInterval(() => {
+            if (!this.imageToDraw || !this.imageDrawParams) {
+                return;
+            }
+            this.canvasCtx.drawImage(this.imageToDraw, this.imageDrawParams.offsetX, this.imageDrawParams.offsetY, this.imageDrawParams.width, this.imageDrawParams.height);
+            this._drawPresenceIndicator();
+        }, this._redrawIntervalMs());
+    }
+
+    setPresenceIndicator(state) {
+        if (state === this.presenceState) {
+            return;
+        }
+        this.presenceState = state;
+        // Timed from the change, so a state always starts its pulse lit.
+        this.presenceChangedAt = performance.now();
+        if (this.imageToDraw && this.imageDrawParams) {
+            // Repaint at once, so a state that stops drawing takes the bead off the tile
+            // now rather than at the next tick.
+            this.canvasCtx.drawImage(this.imageToDraw, this.imageDrawParams.offsetX, this.imageDrawParams.offsetY, this.imageDrawParams.width, this.imageDrawParams.height);
+            this._drawPresenceIndicator();
+        }
+        if (this.imageRedrawInterval) {
+            this._startImageRedrawInterval();
+        }
+    }
+
+    _drawPresenceIndicator() {
+        const settings = this._presenceSettings();
+        if (!settings || !this.imageDrawParams) {
+            return;
+        }
+        const elapsed = (performance.now() - this.presenceChangedAt) / 1000;
+        const lit = 0.5 - 0.5 * Math.cos((2 * Math.PI * (elapsed % settings.cycleSeconds)) / settings.cycleSeconds);
+        const alpha = 0.30 + 0.70 * lit;
+
+        const { offsetX, offsetY, width, height } = this.imageDrawParams;
+        const side = Math.min(width, height);
+        const radius = Math.max(3, side * PRESENCE_BEAD_RADIUS) * (0.78 + 0.22 * lit);
+        const inset = side * PRESENCE_BEAD_INSET + Math.max(3, side * PRESENCE_BEAD_RADIUS);
+        const x = offsetX + inset;
+        const y = offsetY + height - inset;
+
+        const ctx = this.canvasCtx;
+        ctx.save();
+        // A glow in the bead's own colour, so the pulse reads as light rather than as a
+        // dot changing size...
+        const glowRadius = radius * PRESENCE_GLOW_RADIUS;
+        const glow = ctx.createRadialGradient(x, y, 0, x, y, glowRadius);
+        glow.addColorStop(0, settings.color);
+        glow.addColorStop(1, "rgba(0, 0, 0, 0)");
+        ctx.globalAlpha = PRESENCE_GLOW_ALPHA * alpha;
+        ctx.fillStyle = glow;
+        ctx.beginPath();
+        ctx.arc(x, y, glowRadius, 0, 2 * Math.PI);
+        ctx.fill();
+        // ...and a thin dark rim, so the edge survives a pale avatar.
+        ctx.globalAlpha = PRESENCE_RIM_ALPHA * alpha;
+        ctx.fillStyle = PRESENCE_RIM_COLOR;
+        ctx.beginPath();
+        ctx.arc(x, y, radius * PRESENCE_RIM_RADIUS, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = settings.color;
+        ctx.beginPath();
+        ctx.arc(x, y, radius, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.restore();
     }
 
 
@@ -663,6 +772,10 @@ class BotOutputManager {
 
     async displayImage(imageBytes) {
         return this.webcamVideoOutputStream.displayImage(imageBytes);
+    }
+
+    setPresenceIndicator(state) {
+        return this.webcamVideoOutputStream.setPresenceIndicator(state);
     }
 
     isVideoPlaying() {

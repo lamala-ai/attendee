@@ -8,7 +8,7 @@ In the Attendee platform, a bot is an automated participant that can join virtua
 1. Recording: Bots can record audio and video from meetings
 2. Transcription: Bots can transcribe meeting conversations in real-time
 3. Speech: Bots can speak arbitrary audio into the meeting
-4. Avatars: Bots can display arbitrary images from their virtual webcam
+4. Avatars: Bots can display arbitrary images from their virtual webcam, with an optional pulsing presence indicator drawn over them (see `presence_indicator.md`)
 5. Chat: Bots can record and send chat messages
 
 ## Bot States

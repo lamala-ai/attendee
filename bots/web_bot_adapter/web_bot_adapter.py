@@ -1072,6 +1072,11 @@ class WebBotAdapter(BotAdapter):
             list(image_bytes),
         )
 
+    def set_presence_indicator(self, state):
+        # Drawn by the page rather than pushed as frames: the canvas is already captured
+        # as the bot's video track, so a pulse costs nothing but this one call.
+        self.driver.execute_script("window.botOutputManager.setPresenceIndicator(arguments[0]);", state)
+
     def send_raw_audio(self, bytes, sample_rate):
         """
         Sends raw audio bytes to the Google Meet call.

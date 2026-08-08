@@ -40,6 +40,11 @@ urlpatterns = [
         name="bot-output-video",
     ),
     path(
+        "bots/<str:object_id>/presence_indicator",
+        bots_api_views.PresenceIndicatorView.as_view(),
+        name="bot-presence-indicator",
+    ),
+    path(
         "bots/<str:object_id>/speech",
         bots_api_views.SpeechView.as_view(),
         name="bot-speech",
