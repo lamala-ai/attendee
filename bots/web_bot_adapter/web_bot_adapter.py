@@ -379,6 +379,20 @@ class WebBotAdapter(BotAdapter):
                         elif json_data.get("type") == "CaptionUpdate":
                             self.handle_caption_update(json_data)
 
+                        elif json_data.get("type") == "BOT_OUTPUT_MEDIA_STREAM_NEVER_ARRIVED":
+                            # The page gave up waiting for the webpage streamer's video.
+                            # Warned rather than merely logged because every other line
+                            # on this path says success: the manager has already printed
+                            # "Playing bot output media stream to screenshare", the
+                            # streamer has already answered /start_streaming with a 200,
+                            # and the only thing that did not happen is the one the room
+                            # can see.
+                            logger.warning(
+                                "The bot never rendered its output media stream to %s: %s",
+                                json_data.get("outputDestination"),
+                                json_data.get("reason"),
+                            )
+
                         elif json_data.get("type") == "ChatMessage":
                             self.handle_chat_message(json_data)
 
