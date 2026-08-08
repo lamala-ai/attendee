@@ -1,17 +1,33 @@
 // The bot's presence indicator, mirroring bots/presence_indicator.py so a tile looks
-// the same whichever adapter drew it. Change one, change the other.
-const PRESENCE_INDICATOR = {
-    listening: { color: "#75D87A", cycleSeconds: 2.8 },
-    working: { color: "#F6D795", cycleSeconds: 0.9 },
+// the same whichever adapter drew it. Change one, change the other. The one thing that
+// cannot be mirrored is the glyphs - that side has OpenCV's stroked font and this side
+// has the browser's - so the label is the same word in the same box at the same size,
+// drawn by two typesetters.
+const PRESENCE_GLOW = {
+    speaking: { color: "#75D87A", cycleSeconds: 1.6 },
+    working: { color: "#F7F8F8", cycleSeconds: 0.9 },
+};
+// Listening is in here and not in the glow: a word, and no light.
+const PRESENCE_LABELS = {
+    listening: "LISTENING",
+    working: "WORKING",
+    speaking: "TALKING",
 };
 const PRESENCE_FRAME_INTERVAL_MS = 100;
-const PRESENCE_BEAD_RADIUS = 0.052;
-const PRESENCE_BEAD_INSET = 0.10;
-const PRESENCE_GLOW_RADIUS = 2.0;
-const PRESENCE_GLOW_ALPHA = 0.20;
-const PRESENCE_RIM_RADIUS = 1.14;
-const PRESENCE_RIM_ALPHA = 0.5;
-const PRESENCE_RIM_COLOR = "#14110D";
+const PRESENCE_RING_RADIUS = 0.44;
+const PRESENCE_RING_WIDTH = 0.045;
+const PRESENCE_RING_ALPHA = 0.85;
+const PRESENCE_RING_BLOOM = 3.4;
+const PRESENCE_RING_BLOOM_ALPHA = 0.42;
+const PRESENCE_LABEL_WIDTH = 0.50;
+const PRESENCE_LABEL_HEIGHT = 0.13;
+const PRESENCE_LABEL_INSET = 0.085;
+const PRESENCE_LABEL_FILL_WIDTH = 0.78;
+const PRESENCE_LABEL_FILL_HEIGHT = 0.42;
+const PRESENCE_PLATE_COLOR = "#14110D";
+const PRESENCE_PLATE_ALPHA = 0.62;
+const PRESENCE_LABEL_COLOR = "#F7F8F8";
+const PRESENCE_LABEL_ALPHA = 0.96;
 
 // Holds the state of a bot video output stream. We need this class because there are two bot video output streams, one for webcam and one for screenshare.
 class BotVideoOutputStream {
@@ -381,15 +397,22 @@ class BotVideoOutputStream {
     // --- the bot's own presence indicator ---------------------------------
     //
     // A bot sitting quietly in a meeting looks exactly like a bot whose process died,
-    // and sitting quietly is what it does for most of a call. So the tile carries a
-    // pulsing bead: slow while listening, faster while something is still owed, and
-    // nothing at all while it is speaking, when the room can hear it anyway.
+    // and sitting quietly is what it does for most of a call. So the tile says what it
+    // is doing in a word, and glows around the avatar when there is something a word
+    // alone would be too slow to say: white while an answer is still owed, green while
+    // it is the one talking.
     //
     // Nothing is sent per frame. The state is set once and the canvas - which is
     // already captured as a video track - animates itself.
 
     _presenceSettings() {
-        return PRESENCE_INDICATOR[this.presenceState] || null;
+        return PRESENCE_GLOW[this.presenceState] || null;
+    }
+
+    _presenceDraws() {
+        // Not the same question as _presenceSettings: listening draws a word and never
+        // moves, so it is painted once and kept off the fast timer.
+        return Boolean(PRESENCE_LABELS[this.presenceState]);
     }
 
     _redrawIntervalMs() {
@@ -416,7 +439,7 @@ class BotVideoOutputStream {
         // Timed from the change, so a state always starts its pulse lit.
         this.presenceChangedAt = performance.now();
         if (this.imageToDraw && this.imageDrawParams) {
-            // Repaint at once, so a state that stops drawing takes the bead off the tile
+            // Repaint at once, so a state that stops drawing takes the glow off the tile
             // now rather than at the next tick.
             this.canvasCtx.drawImage(this.imageToDraw, this.imageDrawParams.offsetX, this.imageDrawParams.offsetY, this.imageDrawParams.width, this.imageDrawParams.height);
             this._drawPresenceIndicator();
@@ -427,46 +450,99 @@ class BotVideoOutputStream {
     }
 
     _drawPresenceIndicator() {
-        const settings = this._presenceSettings();
-        if (!settings || !this.imageDrawParams) {
+        if (!this._presenceDraws() || !this.imageDrawParams) {
             return;
         }
-        const elapsed = (performance.now() - this.presenceChangedAt) / 1000;
-        const lit = 0.5 - 0.5 * Math.cos((2 * Math.PI * (elapsed % settings.cycleSeconds)) / settings.cycleSeconds);
-        const alpha = 0.30 + 0.70 * lit;
-
         const { offsetX, offsetY, width, height } = this.imageDrawParams;
         const side = Math.min(width, height);
-        const radius = Math.max(3, side * PRESENCE_BEAD_RADIUS) * (0.78 + 0.22 * lit);
-        const inset = side * PRESENCE_BEAD_INSET + Math.max(3, side * PRESENCE_BEAD_RADIUS);
-        const x = offsetX + inset;
-        const y = offsetY + height - inset;
-
         const ctx = this.canvasCtx;
         ctx.save();
-        // A glow in the bead's own colour, so the pulse reads as light rather than as a
-        // dot changing size...
-        const glowRadius = radius * PRESENCE_GLOW_RADIUS;
-        const glow = ctx.createRadialGradient(x, y, 0, x, y, glowRadius);
-        glow.addColorStop(0, settings.color);
-        glow.addColorStop(1, "rgba(0, 0, 0, 0)");
-        ctx.globalAlpha = PRESENCE_GLOW_ALPHA * alpha;
-        ctx.fillStyle = glow;
+
+        const settings = this._presenceSettings();
+        if (settings) {
+            const elapsed = (performance.now() - this.presenceChangedAt) / 1000;
+            const lit = 0.5 - 0.5 * Math.cos((2 * Math.PI * (elapsed % settings.cycleSeconds)) / settings.cycleSeconds);
+            const alpha = PRESENCE_RING_ALPHA * (0.22 + 0.78 * lit);
+            const centerX = offsetX + width / 2;
+            const centerY = offsetY + height / 2;
+            const peak = side * PRESENCE_RING_RADIUS;
+            const band = Math.max(1, side * PRESENCE_RING_WIDTH);
+            // Two bands, not one: the tight one is the ring and the wide dim one either
+            // side of it is what makes the same shape read as light coming off the tile
+            // rather than as a hoop drawn on it. Radial stops stand in for the squared
+            // falloff the Python side computes per pixel.
+            const bloom = band * PRESENCE_RING_BLOOM;
+            const gradient = ctx.createRadialGradient(centerX, centerY, Math.max(0, peak - bloom), centerX, centerY, peak + bloom);
+            const core = band / (2 * bloom);
+            gradient.addColorStop(0, this._presenceColorWithAlpha(settings.color, 0));
+            // A gradient stop interpolates in a straight line, and the halo the Python
+            // side computes is a squared falloff - so it is sampled at a few points
+            // rather than left as one ramp, which is visibly wider than the other tile.
+            for (const away of [0.75, 0.5, 0.25]) {
+                const alphaHere = PRESENCE_RING_BLOOM_ALPHA * (1 - away) * (1 - away);
+                const offset = core + away * (0.5 - core);
+                gradient.addColorStop(0.5 - offset, this._presenceColorWithAlpha(settings.color, alphaHere));
+            }
+            gradient.addColorStop(0.5 - core, this._presenceColorWithAlpha(settings.color, PRESENCE_RING_BLOOM_ALPHA));
+            gradient.addColorStop(0.5, settings.color);
+            gradient.addColorStop(0.5 + core, this._presenceColorWithAlpha(settings.color, PRESENCE_RING_BLOOM_ALPHA));
+            for (const away of [0.25, 0.5, 0.75]) {
+                const alphaHere = PRESENCE_RING_BLOOM_ALPHA * (1 - away) * (1 - away);
+                const offset = core + away * (0.5 - core);
+                gradient.addColorStop(0.5 + offset, this._presenceColorWithAlpha(settings.color, alphaHere));
+            }
+            gradient.addColorStop(1, this._presenceColorWithAlpha(settings.color, 0));
+            ctx.globalAlpha = alpha;
+            ctx.fillStyle = gradient;
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, peak + bloom, 0, 2 * Math.PI);
+            ctx.fill();
+        }
+
+        // The word, on a plate that keeps it legible over a photograph. Both sit inside
+        // the circle inscribed in the picture, because that is what survives a client
+        // cropping the tile to fill its own shape.
+        const boxWidth = side * PRESENCE_LABEL_WIDTH;
+        const boxHeight = side * PRESENCE_LABEL_HEIGHT;
+        const boxLeft = offsetX + (width - boxWidth) / 2;
+        const boxTop = offsetY + height - side * PRESENCE_LABEL_INSET - boxHeight;
+        const radius = boxHeight / 2;
+        ctx.globalAlpha = PRESENCE_PLATE_ALPHA;
+        ctx.fillStyle = PRESENCE_PLATE_COLOR;
         ctx.beginPath();
-        ctx.arc(x, y, glowRadius, 0, 2 * Math.PI);
+        ctx.moveTo(boxLeft + radius, boxTop);
+        ctx.lineTo(boxLeft + boxWidth - radius, boxTop);
+        ctx.arc(boxLeft + boxWidth - radius, boxTop + radius, radius, -Math.PI / 2, Math.PI / 2);
+        ctx.lineTo(boxLeft + radius, boxTop + boxHeight);
+        ctx.arc(boxLeft + radius, boxTop + radius, radius, Math.PI / 2, -Math.PI / 2);
         ctx.fill();
-        // ...and a thin dark rim, so the edge survives a pale avatar.
-        ctx.globalAlpha = PRESENCE_RIM_ALPHA * alpha;
-        ctx.fillStyle = PRESENCE_RIM_COLOR;
-        ctx.beginPath();
-        ctx.arc(x, y, radius * PRESENCE_RIM_RADIUS, 0, 2 * Math.PI);
-        ctx.fill();
-        ctx.globalAlpha = alpha;
-        ctx.fillStyle = settings.color;
-        ctx.beginPath();
-        ctx.arc(x, y, radius, 0, 2 * Math.PI);
-        ctx.fill();
+
+        const text = PRESENCE_LABELS[this.presenceState];
+        // Sized by measuring rather than guessing, so "LISTENING" and "TALKING" fill the
+        // same plate to the same margins instead of one of them overrunning it.
+        let fontSize = boxHeight * PRESENCE_LABEL_FILL_HEIGHT * 1.4;
+        ctx.font = `700 ${fontSize}px Archivo, Helvetica, Arial, sans-serif`;
+        const measured = ctx.measureText(text).width;
+        const room = boxWidth * PRESENCE_LABEL_FILL_WIDTH;
+        if (measured > room) {
+            fontSize = fontSize * (room / measured);
+            ctx.font = `700 ${fontSize}px Archivo, Helvetica, Arial, sans-serif`;
+        }
+        ctx.globalAlpha = PRESENCE_LABEL_ALPHA;
+        ctx.fillStyle = PRESENCE_LABEL_COLOR;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(text, boxLeft + boxWidth / 2, boxTop + boxHeight / 2);
         ctx.restore();
+    }
+
+    /** `#rrggbb` as an rgba() string - the gradient stops need a transparent copy of
+     *  the same colour, and a bare hex has nowhere to put the alpha. */
+    _presenceColorWithAlpha(color, alpha) {
+        const red = parseInt(color.slice(1, 3), 16);
+        const green = parseInt(color.slice(3, 5), 16);
+        const blue = parseInt(color.slice(5, 7), 16);
+        return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
     }
 
 

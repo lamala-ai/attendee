@@ -56,7 +56,7 @@ class BotAdapter:
     DEBUG_RECORDING_FILE_PATH = "/tmp/debug_screen_recording.mp4"
 
     def set_presence_indicator(self, state):
-        """Show a pulsing mark over the bot's own avatar - see bots/presence_indicator.py.
+        """Say what the bot is doing on its own tile - see bots/presence_indicator.py.
 
         A no-op by default: on an adapter with no video output of its own there is
         nothing to draw on, and a cosmetic mark is never worth failing a call over.
