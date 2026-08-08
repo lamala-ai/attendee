@@ -30,63 +30,134 @@ def planes(frame, width, height):
 
 
 class TestPresenceIndicatorDrawing(unittest.TestCase):
-    """The bead itself. No database, no adapter - just what lands in the pixels."""
+    """The glow and the label themselves. No database, no adapter - just the pixels."""
 
     WIDTH, HEIGHT = 320, 180
 
-    def test_only_animated_states_draw_anything(self):
-        for state in (presence_indicator.SPEAKING, presence_indicator.OFF, None, "nonsense"):
+    def test_only_a_state_we_have_a_word_for_draws_anything(self):
+        for state in (presence_indicator.OFF, None, "nonsense"):
             frame = blank_i420(self.WIDTH, self.HEIGHT)
             untouched = bytes(frame)
             presence_indicator.paint_i420(frame, self.WIDTH, self.HEIGHT, state, 0.0)
             self.assertEqual(bytes(frame), untouched, f"{state} should draw nothing")
 
-    def test_the_bead_lands_where_the_geometry_says_and_nowhere_else(self):
+    def test_listening_draws_its_word_without_drawing_a_glow(self):
+        """Fails against the bead, where listening was the *pulsing* state and speaking
+        drew nothing at all: both of those are now the other way round."""
+        self.assertTrue(presence_indicator.draws(presence_indicator.LISTENING))
+        self.assertFalse(presence_indicator.is_animated(presence_indicator.LISTENING))
+
         frame = blank_i420(self.WIDTH, self.HEIGHT)
         presence_indicator.paint_i420(frame, self.WIDTH, self.HEIGHT, presence_indicator.LISTENING, 1.4)
+        luma, _, _ = planes(frame, self.WIDTH, self.HEIGHT)
+
+        left, top, box_width, box_height = presence_indicator.label_box(self.WIDTH, self.HEIGHT)
+        plate = luma[top : top + box_height, left : left + box_width]
+        self.assertTrue((plate != 90).any(), "the label did not land in its own box")
+        # Where the glow would be if this state had one: the ring rides at 0.44 of the
+        # shorter side out from the middle, level with the centre of the picture.
+        ring_x = int(self.WIDTH / 2 + min(self.WIDTH, self.HEIGHT) * presence_indicator.RING_RADIUS)
+        self.assertEqual(luma[self.HEIGHT // 2, ring_x], 90, "listening should not glow")
+
+    def test_a_glowing_state_rings_the_picture_in_its_own_colour(self):
+        frame = blank_i420(self.WIDTH, self.HEIGHT)
+        settings = presence_indicator.GLOW[presence_indicator.SPEAKING]
+        lit = settings["cycle_seconds"] / 2
+        presence_indicator.paint_i420(frame, self.WIDTH, self.HEIGHT, presence_indicator.SPEAKING, lit)
         luma, blue, red = planes(frame, self.WIDTH, self.HEIGHT)
 
-        center_x, center_y, _ = presence_indicator.bead_geometry(self.WIDTH, self.HEIGHT)
-        self.assertNotEqual(luma[int(center_y), int(center_x)], 90, "the bead did not land on its own centre")
-        # Chroma follows it, or the bead would be a grey dot.
-        self.assertNotEqual(blue[int(center_y / 2), int(center_x / 2)], 128)
-        self.assertNotEqual(red[int(center_y / 2), int(center_x / 2)], 128)
-        # And the rest of the picture is untouched: this is a mark, not a filter.
-        self.assertEqual(luma[0, self.WIDTH - 1], 90)
-        self.assertEqual(luma[0, 0], 90)
+        side = min(self.WIDTH, self.HEIGHT)
+        ring_x = int(self.WIDTH / 2 + side * presence_indicator.RING_RADIUS)
+        row = self.HEIGHT // 2
+        self.assertNotEqual(luma[row, ring_x], 90, "the ring did not land on its own band")
+        # Chroma follows it, or a green glow would be a grey one.
+        self.assertNotEqual(blue[row // 2, ring_x // 2], 128)
+        self.assertNotEqual(red[row // 2, ring_x // 2], 128)
+        # And the middle of the face is left alone: this is a ring, not a wash.
+        self.assertEqual(luma[row, self.WIDTH // 2], 90)
 
-    def test_the_bead_follows_the_picture_rather_than_the_frame(self):
-        """A square avatar scaled into a 16:9 capability is letterboxed. A bead in the
-        corner of the frame would sit on the black bar instead of on the avatar."""
+    def test_the_glow_follows_the_picture_rather_than_the_frame(self):
+        """A square avatar scaled into a 16:9 capability is letterboxed. A ring measured
+        off the frame would circle the black bars instead of the avatar."""
         frame = blank_i420(self.WIDTH, self.HEIGHT)
         rect = presence_indicator.letterboxed_content_rect((512, 512), (self.WIDTH, self.HEIGHT))
         self.assertEqual(rect, (70, 0, 180, 180))
 
-        presence_indicator.paint_i420(frame, self.WIDTH, self.HEIGHT, presence_indicator.LISTENING, 1.4, rect)
+        presence_indicator.paint_i420(frame, self.WIDTH, self.HEIGHT, presence_indicator.WORKING, 0.45, rect)
         luma, _, _ = planes(frame, self.WIDTH, self.HEIGHT)
-        center_x, center_y, _ = presence_indicator.bead_geometry(rect[2], rect[3])
-        self.assertNotEqual(luma[int(center_y + rect[1]), int(center_x + rect[0])], 90)
-        # The left bar - where an unaware bead would have gone - is still black.
-        self.assertEqual(luma[self.HEIGHT - 10, 5], 90)
+        ring_x = int(rect[0] + rect[2] / 2 + rect[2] * presence_indicator.RING_RADIUS)
+        self.assertNotEqual(luma[rect[3] // 2, ring_x], 90)
+        # The left bar - where a frame-measured ring would have gone - is untouched.
+        self.assertEqual(luma[self.HEIGHT // 2, 2], 90)
 
-    def test_the_pulse_actually_pulses_and_the_two_states_pulse_differently(self):
-        listening = presence_indicator.ANIMATED[presence_indicator.LISTENING]["cycle_seconds"]
-        self.assertAlmostEqual(presence_indicator.pulse(presence_indicator.LISTENING, 0.0), 0.0)
-        self.assertAlmostEqual(presence_indicator.pulse(presence_indicator.LISTENING, listening / 2), 1.0)
-        self.assertAlmostEqual(presence_indicator.pulse(presence_indicator.LISTENING, listening), 0.0)
-        # Working is the faster one - that is the whole difference the room reads.
+    def test_everything_readable_survives_the_crop_a_client_makes(self):
+        """The rule the geometry exists for: a client crops a tile to fill its own
+        shape, and what survives every crop of a square picture is its inscribed circle.
+        The lit band and the label have to be inside it. The halo either side of the
+        band may cross it - it is fading to nothing out there - so this measures what is
+        actually readable rather than every pixel that changed at all."""
+        size = 240
+        frame = blank_i420(size, size)
+        presence_indicator.paint_i420(frame, size, size, presence_indicator.SPEAKING, 0.8)
+        luma, _, _ = planes(frame, size, size)
+
+        drawn = np.abs(luma.astype(np.int16) - 90)
+        self.assertTrue(drawn.any(), "nothing was drawn at all")
+        ys, xs = np.nonzero(drawn > drawn.max() * 0.4)
+        distance = np.sqrt((xs + 0.5 - size / 2) ** 2 + (ys + 0.5 - size / 2) ** 2)
+        self.assertLessEqual(distance.max(), size / 2)
+
+    def test_nothing_is_drawn_outside_the_picture_at_all(self):
+        """Whatever the halo does inside the avatar, it may not spill onto the black
+        bars the letterboxing put beside it - a glow around the frame rather than around
+        the face is the one version of this that looks like a bug."""
+        frame = blank_i420(self.WIDTH, self.HEIGHT)
+        rect = presence_indicator.letterboxed_content_rect((512, 512), (self.WIDTH, self.HEIGHT))
+        presence_indicator.paint_i420(frame, self.WIDTH, self.HEIGHT, presence_indicator.SPEAKING, 0.8, rect)
+        luma, _, _ = planes(frame, self.WIDTH, self.HEIGHT)
+
+        x, y, width, height = rect
+        outside = luma.copy()
+        outside[y : y + height, x : x + width] = 90
+        self.assertFalse((outside != 90).any(), "the glow reached the letterbox bars")
+
+    def test_the_pulse_actually_pulses_and_the_two_glows_pulse_differently(self):
+        speaking = presence_indicator.GLOW[presence_indicator.SPEAKING]["cycle_seconds"]
+        self.assertAlmostEqual(presence_indicator.pulse(presence_indicator.SPEAKING, 0.0), 0.0)
+        self.assertAlmostEqual(presence_indicator.pulse(presence_indicator.SPEAKING, speaking / 2), 1.0)
+        self.assertAlmostEqual(presence_indicator.pulse(presence_indicator.SPEAKING, speaking), 0.0)
+        # Working is the faster one - it is the state somebody is waiting through.
         self.assertLess(
-            presence_indicator.ANIMATED[presence_indicator.WORKING]["cycle_seconds"],
-            listening,
+            presence_indicator.GLOW[presence_indicator.WORKING]["cycle_seconds"],
+            speaking,
         )
 
     def test_a_dim_beat_and_a_lit_beat_are_not_the_same_picture(self):
-        cycle = presence_indicator.ANIMATED[presence_indicator.LISTENING]["cycle_seconds"]
+        cycle = presence_indicator.GLOW[presence_indicator.WORKING]["cycle_seconds"]
         dim = blank_i420(self.WIDTH, self.HEIGHT)
         lit = blank_i420(self.WIDTH, self.HEIGHT)
-        presence_indicator.paint_i420(dim, self.WIDTH, self.HEIGHT, presence_indicator.LISTENING, 0.0)
-        presence_indicator.paint_i420(lit, self.WIDTH, self.HEIGHT, presence_indicator.LISTENING, cycle / 2)
+        presence_indicator.paint_i420(dim, self.WIDTH, self.HEIGHT, presence_indicator.WORKING, 0.0)
+        presence_indicator.paint_i420(lit, self.WIDTH, self.HEIGHT, presence_indicator.WORKING, cycle / 2)
         self.assertNotEqual(bytes(dim), bytes(lit))
+
+    def test_each_state_says_a_different_word(self):
+        words = [presence_indicator.LABELS[state] for state in (presence_indicator.LISTENING, presence_indicator.WORKING, presence_indicator.SPEAKING)]
+        self.assertEqual(len(set(words)), 3)
+        listening = blank_i420(self.WIDTH, self.HEIGHT)
+        working = blank_i420(self.WIDTH, self.HEIGHT)
+        presence_indicator.paint_i420(listening, self.WIDTH, self.HEIGHT, presence_indicator.LISTENING, 0.0)
+        # Compared at the same point of its cycle where the glow is at its dimmest, so
+        # what differs between these two frames is the lettering rather than the light.
+        presence_indicator.paint_i420(working, self.WIDTH, self.HEIGHT, presence_indicator.WORKING, 0.0)
+        left, top, box_width, box_height = presence_indicator.label_box(self.WIDTH, self.HEIGHT)
+        one, _, _ = planes(listening, self.WIDTH, self.HEIGHT)
+        two, _, _ = planes(working, self.WIDTH, self.HEIGHT)
+        self.assertFalse(
+            np.array_equal(
+                one[top : top + box_height, left : left + box_width],
+                two[top : top + box_height, left : left + box_width],
+            )
+        )
 
     def test_an_odd_or_empty_frame_is_left_alone_rather_than_corrupted(self):
         for width, height in ((321, 180), (0, 0), (320, 181)):

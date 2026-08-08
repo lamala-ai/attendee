@@ -844,9 +844,10 @@ class ZoomBotAdapter(BotAdapter):
 
         now = time.monotonic()
         frame = self.current_image_to_send
-        if presence_indicator.is_animated(self.presence_indicator_state):
+        if presence_indicator.draws(self.presence_indicator_state):
             # Painted into a copy, never into the base frame: the base is what a state
-            # change repaints from, and blending into it would smear the bead across it.
+            # change repaints from, and blending into it would smear every glow this
+            # meeting has drawn across it.
             painted = bytearray(frame)
             presence_indicator.paint_i420(
                 painted,
@@ -857,9 +858,11 @@ class ZoomBotAdapter(BotAdapter):
                 self.current_image_content_rect,
             )
             frame = bytes(painted)
-        elif self.last_image_sent_to_zoom_at and now - self.last_image_sent_to_zoom_at < 0.5:
-            # Nothing is moving, so keep the still's original refresh rate rather than
-            # sending the same picture ten times a second.
+        if not presence_indicator.is_animated(self.presence_indicator_state) and self.last_image_sent_to_zoom_at and now - self.last_image_sent_to_zoom_at < 0.5:
+            # Nothing is moving - a state can draw a word without ever changing, and
+            # listening is that state for most of a meeting - so keep the still's
+            # original refresh rate rather than sending the same picture ten times a
+            # second.
             return True
 
         self.last_image_sent_to_zoom_at = now
@@ -881,9 +884,10 @@ class ZoomBotAdapter(BotAdapter):
         # through a fade somebody else's clock was in the middle of.
         self.presence_indicator_started_at = time.monotonic()
         if not presence_indicator.is_animated(state) and self.current_raw_image_to_send:
-            # Repaint the plain avatar at once. Zoom holds the last frame it was given,
-            # so without this the room would keep looking at whatever the bead was doing
-            # when the bot stopped drawing it. Only with an image to repaint: the send
+            # Repaint at once. Zoom holds the last frame it was given, so without this
+            # the room would keep looking at whatever the glow was doing when the bot
+            # stopped pulsing - and would never see the new word. Only with an image to
+            # repaint: the send
             # path clears the timeout id when there is none, and clearing it from
             # outside the timer would let the next image install a second one.
             self.last_image_sent_to_zoom_at = 0.0
