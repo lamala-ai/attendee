@@ -814,8 +814,16 @@ class ZoomBotAdapter(BotAdapter):
         # Add a timeout to keep the image on screen if one isn't already active. It ticks
         # at the presence indicator's frame rate and sends at the old cadence when there is
         # no indicator to animate, so a still costs exactly what it always did.
+        #
+        # TEMPORARY, for bisecting a regression: setExternalShareSource started
+        # returning SDKERR_UNKNOWN some time between 2026-08-05 (confirmed working
+        # twice) and 2026-08-08 (confirmed broken), and this 500ms -> 100ms change is
+        # the only other thing that landed on this adapter's single-threaded GLib loop
+        # in that window - the same loop setExternalShareSource has to run on. Testing
+        # whether going back to the slower tick lets the share call succeed again.
+        # Revert this comment and the hardcoded 500 once that's confirmed or ruled out.
         if self.send_image_timeout_id is None:
-            self.send_image_timeout_id = GLib.timeout_add(presence_indicator.FRAME_INTERVAL_MS, self.send_current_image_to_zoom)
+            self.send_image_timeout_id = GLib.timeout_add(500, self.send_current_image_to_zoom)
 
     def send_current_image_to_zoom(self):
         if self.requested_leave or self.cleaned_up or (not self.current_raw_image_to_send):
