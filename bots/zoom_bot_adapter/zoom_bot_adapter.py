@@ -1387,4 +1387,16 @@ class ZoomBotAdapter(BotAdapter):
     def is_bot_ready_for_webpage_streamer(self):
         # The share source cannot be registered before the bot is actually in the
         # meeting, and the streamer must not be told to connect until it can be.
-        return bool(self.meeting_service) and self.my_participant_id is not None and not self.requested_leave
+        ready = bool(self.meeting_service) and self.my_participant_id is not None and not self.requested_leave
+        if not ready and int(time.monotonic()) % 5 == 0:
+            # Temporary: WebpageStreamerManager polls this once a second, and a meeting
+            # has stayed stuck reporting "not ready" for its entire length with nothing
+            # else in the logs to say which of the three conditions is actually false.
+            # Throttled to once per ~5s of the poll so a stuck meeting does not spam.
+            logger.info(
+                "is_bot_ready_for_webpage_streamer: meeting_service=%s my_participant_id=%r requested_leave=%s",
+                bool(self.meeting_service),
+                self.my_participant_id,
+                self.requested_leave,
+            )
+        return ready
