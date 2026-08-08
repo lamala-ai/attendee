@@ -8,6 +8,7 @@ import jwt
 import numpy as np
 import zoom_meeting_sdk as zoom
 
+from bots import presence_indicator
 from bots.automatic_leave_utils import participant_is_another_bot
 from bots.bot_adapter import BotAdapter
 from bots.meeting_url_utils import parse_zoom_join_url
@@ -214,6 +215,15 @@ class ZoomBotAdapter(BotAdapter):
         self.current_raw_image_to_send = None
         # Scaled image to send to Zoom
         self.current_image_to_send = None
+        # Where the picture actually sits inside that frame: a square avatar scaled into
+        # a 16:9 capability is letterboxed, and the presence indicator belongs on the
+        # picture rather than on the black bar beside it.
+        self.current_image_content_rect = None
+        # The mark drawn over the avatar, and when it was last changed - the pulse is
+        # computed from wall-clock time, so it does not drift with timer jitter.
+        self.presence_indicator_state = None
+        self.presence_indicator_started_at = 0.0
+        self.last_image_sent_to_zoom_at = 0.0
         self.recording_is_paused = False
 
         self.ready_to_send_chat_messages = False
@@ -782,6 +792,11 @@ class ZoomBotAdapter(BotAdapter):
         # We have to scale the image to the zoom video capability width and height for it to display properly
         yuv420_image_bytes_scaled = scale_i420(yuv420_image_bytes, (original_width, original_height), (self.suggested_video_cap.width, self.suggested_video_cap.height))
 
+        self.current_image_content_rect = presence_indicator.letterboxed_content_rect(
+            (original_width, original_height),
+            (self.suggested_video_cap.width, self.suggested_video_cap.height),
+        )
+
         return yuv420_image_bytes_scaled
 
     def send_raw_image(self, image_bytes):
@@ -796,9 +811,11 @@ class ZoomBotAdapter(BotAdapter):
         # We can't compute the scaled image immediately because the video caps may have not arrived yet. So set it to None, which indicates it needs to be recomputed.
         self.current_image_to_send = None
 
-        # Add a timeout to send the image every 500ms if one isn't already active
+        # Add a timeout to keep the image on screen if one isn't already active. It ticks
+        # at the presence indicator's frame rate and sends at the old cadence when there is
+        # no indicator to animate, so a still costs exactly what it always did.
         if self.send_image_timeout_id is None:
-            self.send_image_timeout_id = GLib.timeout_add(500, self.send_current_image_to_zoom)
+            self.send_image_timeout_id = GLib.timeout_add(presence_indicator.FRAME_INTERVAL_MS, self.send_current_image_to_zoom)
 
     def send_current_image_to_zoom(self):
         if self.requested_leave or self.cleaned_up or (not self.current_raw_image_to_send):
@@ -825,13 +842,52 @@ class ZoomBotAdapter(BotAdapter):
             self.cannot_send_video_error_ticker += 1
             return True
 
-        send_video_frame_response = self.video_sender.sendVideoFrame(self.current_image_to_send, self.suggested_video_cap.width, self.suggested_video_cap.height, 0, zoom.FrameDataFormat_I420_FULL)
+        now = time.monotonic()
+        frame = self.current_image_to_send
+        if presence_indicator.is_animated(self.presence_indicator_state):
+            # Painted into a copy, never into the base frame: the base is what a state
+            # change repaints from, and blending into it would smear the bead across it.
+            painted = bytearray(frame)
+            presence_indicator.paint_i420(
+                painted,
+                self.suggested_video_cap.width,
+                self.suggested_video_cap.height,
+                self.presence_indicator_state,
+                now - self.presence_indicator_started_at,
+                self.current_image_content_rect,
+            )
+            frame = bytes(painted)
+        elif self.last_image_sent_to_zoom_at and now - self.last_image_sent_to_zoom_at < 0.5:
+            # Nothing is moving, so keep the still's original refresh rate rather than
+            # sending the same picture ten times a second.
+            return True
+
+        self.last_image_sent_to_zoom_at = now
+        send_video_frame_response = self.video_sender.sendVideoFrame(frame, self.suggested_video_cap.width, self.suggested_video_cap.height, 0, zoom.FrameDataFormat_I420_FULL)
         if send_video_frame_response != zoom.SDKERR_SUCCESS:
             if self.cannot_send_video_error_ticker % 100 == 0:
                 logger.info(f"send_current_image_to_zoom failed with send_video_frame_response = {send_video_frame_response}")
             self.cannot_send_video_error_ticker += 1
 
         return True
+
+    def set_presence_indicator(self, state):
+        state = presence_indicator.normalize(state)
+        if state == self.presence_indicator_state:
+            return
+        logger.info(f"presence indicator changed from {self.presence_indicator_state} to {state}")
+        self.presence_indicator_state = state
+        # Timed from the change, so every state starts its pulse lit rather than halfway
+        # through a fade somebody else's clock was in the middle of.
+        self.presence_indicator_started_at = time.monotonic()
+        if not presence_indicator.is_animated(state) and self.current_raw_image_to_send:
+            # Repaint the plain avatar at once. Zoom holds the last frame it was given,
+            # so without this the room would keep looking at whatever the bead was doing
+            # when the bot stopped drawing it. Only with an image to repaint: the send
+            # path clears the timeout id when there is none, and clearing it from
+            # outside the timer would let the next image install a second one.
+            self.last_image_sent_to_zoom_at = 0.0
+            self.send_current_image_to_zoom()
 
     def send_video_frame_to_zoom(self, yuv420_image_bytes, original_width, original_height):
         if self.requested_leave or self.cleaned_up or (not self.suggested_video_cap):

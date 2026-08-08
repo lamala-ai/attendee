@@ -1083,6 +1083,11 @@ class Bot(models.Model):
         voice_agent_settings = self.settings.get("voice_agent_settings", {}) or {}
         return voice_agent_settings.get("reserve_resources", False)
 
+    def presence_indicator_state(self):
+        """What the bot should be drawing over its avatar - see bots/presence_indicator.py."""
+        presence_indicator_settings = self.settings.get("presence_indicator", {}) or {}
+        return presence_indicator_settings.get("state", None)
+
     def zoom_tokens_callback_url(self):
         callback_settings = self.settings.get("callback_settings", {})
         if callback_settings is None:

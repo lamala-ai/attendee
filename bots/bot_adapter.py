@@ -1,3 +1,8 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 class BotAdapter:
     class Messages:
         LEAVE_MEETING_WAITING_FOR_HOST = "Leave meeting because received waiting for host status"
@@ -49,3 +54,11 @@ class BotAdapter:
         AUTO_LEAVE_COULD_NOT_ENABLE_CLOSED_CAPTIONS = "AUTO_LEAVE_COULD_NOT_ENABLE_CLOSED_CAPTIONS"
 
     DEBUG_RECORDING_FILE_PATH = "/tmp/debug_screen_recording.mp4"
+
+    def set_presence_indicator(self, state):
+        """Show a pulsing mark over the bot's own avatar - see bots/presence_indicator.py.
+
+        A no-op by default: on an adapter with no video output of its own there is
+        nothing to draw on, and a cosmetic mark is never worth failing a call over.
+        """
+        logger.info(f"set_presence_indicator called with state = {state}, which this adapter does not draw")

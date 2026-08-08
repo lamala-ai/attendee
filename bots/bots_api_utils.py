@@ -36,6 +36,7 @@ from .models import (
 )
 from .serializers import (
     CreateBotSerializer,
+    PatchBotPresenceIndicatorSerializer,
     PatchBotSerializer,
     PatchBotTranscriptionSettingsSerializer,
     PatchBotVoiceAgentSettingsSerializer,
@@ -348,6 +349,25 @@ def patch_bot_voice_agent_settings(bot: Bot, data: dict) -> tuple[Bot | None, di
             bot.settings["voice_agent_settings"]["screenshare_url"] = validated_data.get("screenshare_url")
             if "url" in bot.settings["voice_agent_settings"]:
                 del bot.settings["voice_agent_settings"]["url"]
+        bot.save()
+    except RecordModifiedError:
+        return None, {"error": "Version conflict. Please try again."}
+
+    return bot, None
+
+
+def patch_bot_presence_indicator(bot: Bot, data: dict) -> tuple[Bot | None, dict | None]:
+    # The bot has to be in the meeting to draw anything on its tile. Same gate as media
+    # output, because this is media output - it just costs one call instead of one per frame.
+    if not BotEventManager.is_state_that_can_play_media(bot.state):
+        return None, {"error": f"Bot is in state {BotStates.state_to_api_code(bot.state)} and cannot show a presence indicator"}
+
+    serializer = PatchBotPresenceIndicatorSerializer(data=data)
+    if not serializer.is_valid():
+        return None, serializer.errors
+
+    try:
+        bot.settings["presence_indicator"] = {"state": serializer.validated_data["state"]}
         bot.save()
     except RecordModifiedError:
         return None, {"error": "Version conflict. Please try again."}

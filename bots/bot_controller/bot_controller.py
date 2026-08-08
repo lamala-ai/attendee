@@ -1147,6 +1147,14 @@ class BotController:
             self.adapter.send_chat_message(text=chat_message_request.message, to_user_uuid=chat_message_request.to_user_uuid)
             BotChatMessageRequestManager.set_chat_message_request_sent(chat_message_request)
 
+    def take_action_based_on_presence_indicator_in_db(self):
+        state = self.bot_in_db.presence_indicator_state()
+        try:
+            self.adapter.set_presence_indicator(state)
+        except Exception as e:
+            # Cosmetic by definition: a bot that cannot draw a dot is still in the meeting.
+            logger.warning(f"Error setting presence indicator to {state}: {e}")
+
     def take_action_based_on_voice_agent_settings_in_db(self):
         if self.bot_in_db.should_launch_webpage_streamer():
             self.webpage_streamer_manager.update(url=self.bot_in_db.voice_agent_url(), output_destination=self.bot_in_db.voice_agent_video_output_destination())
@@ -1208,6 +1216,10 @@ class BotController:
                 logger.info(f"Syncing voice agent settings for bot {self.bot_in_db.object_id}")
                 self.bot_in_db.refresh_from_db()
                 self.take_action_based_on_voice_agent_settings_in_db()
+            elif command == "sync_presence_indicator":
+                logger.info(f"Syncing presence indicator for bot {self.bot_in_db.object_id}")
+                self.bot_in_db.refresh_from_db()
+                self.take_action_based_on_presence_indicator_in_db()
             elif command == "sync_transcription_settings":
                 logger.info(f"Syncing transcription settings for bot {self.bot_in_db.object_id}")
                 self.bot_in_db.refresh_from_db()
@@ -2067,6 +2079,9 @@ class BotController:
             # If there are any image media requests, this will start playing them
             # For now the only type of media request is an image, so this will start showing the bot's image
             self.take_action_based_on_image_media_requests_in_db()
+            # And whatever the bot was told to show over that image. A presence indicator
+            # set while the bot was still joining has nothing to draw on until now.
+            self.take_action_based_on_presence_indicator_in_db()
             return
 
         if message.get("message") == BotAdapter.Messages.BOT_RECORDING_PERMISSION_GRANTED:

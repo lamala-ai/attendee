@@ -18,6 +18,7 @@ from drf_spectacular.utils import (
 )
 from rest_framework import serializers
 
+from . import presence_indicator
 from .automatic_leave_configuration import AutomaticLeaveConfiguration
 from .bot_pod_creator.bot_pod_creator import fetch_bot_pod_spec
 from .models import (
@@ -1981,6 +1982,15 @@ class PatchBotVoiceAgentSettingsSerializer(serializers.Serializer):
             raise serializers.ValidationError({"screenshare_url": "URL is not allowed for voice agent. Please set the VOICE_AGENT_URL_PREFIX_ALLOWLIST environment variable to the comma-separated list of allowed URL prefixes."})
 
         return data
+
+
+class PatchBotPresenceIndicatorSerializer(serializers.Serializer):
+    """Serializer for updating the mark the bot draws over its avatar."""
+
+    state = serializers.ChoiceField(
+        choices=presence_indicator.STATES,
+        help_text=("What the bot should show on its own video tile. 'listening' pulses slowly, 'working' pulses faster, and 'speaking' and 'off' show nothing at all. Costs one call per change: the bot animates the frames it is already sending."),
+    )
 
 
 class PatchBotTranscriptionSettingsSerializer(serializers.Serializer):
