@@ -39,20 +39,32 @@ def streamer_is_shared():
     return os.getenv("WEBPAGE_STREAMER_IS_SHARED", "").strip().lower() in ("1", "true", "yes")
 
 
+# A shared page changes on the order of seconds to minutes, not thirty times a second -
+# matches the 1-2fps a meeting platform's own screenshare capture already runs at, so
+# this is a ceiling, not a target. Paired with ximagesrc's use-damage in _video_branch,
+# an unchanging page costs nothing between real updates instead of encoding the same
+# frame at a fixed cadence forever. Module-level so GstVideoStreamTrack, defined below,
+# can use it as a default before WebpageStreamer itself exists.
+CAPTURE_FRAMERATE = 2
+
 # How long a capture that has reached PLAYING may hand over nothing before that is worth
-# acting on. Generous next to the 66ms between frames at 15fps, and short enough to spend
-# twice inside one /offer without the bot's own 30s timeout on that request running out.
+# acting on. Generous next to the interval between frames at CAPTURE_FRAMERATE, and short
+# enough to spend twice inside one /offer without the bot's own 30s timeout on that
+# request running out.
 CAPTURE_FRAME_DEADLINE_SECONDS = 5
 
 
 class GstVideoStreamTrack(MediaStreamTrack):
     kind = "video"
 
-    def __init__(self, sink, width, height, framerate=15, fault=None, stall_deadline=CAPTURE_FRAME_DEADLINE_SECONDS):
+    def __init__(self, sink, width, height, framerate=CAPTURE_FRAMERATE, fault=None, stall_deadline=CAPTURE_FRAME_DEADLINE_SECONDS):
         super().__init__()
         self._sink = sink
         self._width = width
         self._height = height
+        # Recorded, not consulted: recv() paces itself off each buffer's own pts, so
+        # this is what the pipeline was told to capture at, kept for introspection
+        # (tests, logs) rather than driving playback.
         self._framerate = framerate
         self._base_pts_ns = None
         # Asked, never read directly. The pipeline's bus is a *destructive* queue, so
@@ -262,8 +274,8 @@ class WebpageStreamer:
 
     def _video_branch(self, width, height, display_var):
         return f"""
-            ximagesrc display-name={display_var} use-damage=0 show-pointer=false
-                ! video/x-raw,framerate=15/1,width={width},height={height}
+            ximagesrc display-name={display_var} use-damage=1 show-pointer=false
+                ! video/x-raw,framerate={CAPTURE_FRAMERATE}/1,width={width},height={height}
                 ! videoconvert
                 ! video/x-raw,format=I420,width={width},height={height}
                 ! queue max-size-buffers=5 max-size-time=0 leaky=downstream
@@ -362,7 +374,7 @@ class WebpageStreamer:
             sink=self._gst_video_sink,
             width=width,
             height=height,
-            framerate=15,
+            framerate=CAPTURE_FRAMERATE,
             # Handed the streamer's reader rather than the pipeline, so a stalled pull
             # asks the one thing that empties the bus instead of racing it for the error.
             fault=self.capture_fault,
@@ -857,7 +869,11 @@ class WebpageStreamer:
 
     def load_webapp(self):
         app = self.build_web_app()
-        port = 8000
+        # 8000 by default so the shared/Kubernetes deployments (which still address this
+        # process by a fixed hostname:8000 convention) are unaffected. A per-bot process
+        # sharing a host with other bots' streamers needs a port of its own - the caller
+        # that spawns it picks one and passes it here.
+        port = int(os.getenv("WEBPAGE_STREAMER_PORT", "8000"))
 
         # "0.0.0.0" is every IPv4 interface and no IPv6 one. That is fine under docker
         # compose and wrong anywhere the private network is IPv6: on Railway a bot

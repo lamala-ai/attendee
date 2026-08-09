@@ -2,6 +2,9 @@ import json
 import logging
 import os
 import signal
+import socket
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -690,6 +693,8 @@ class BotController:
             logger.info("Telling webpage streamer manager to cleanup...")
             self.webpage_streamer_manager.cleanup()
 
+        self._cleanup_local_webpage_streamer_process()
+
         if self.websocket_client_manager:
             logger.info("Telling websocket client manager to cleanup...")
             self.websocket_client_manager.cleanup()
@@ -899,6 +904,73 @@ class BotController:
         else:
             return 3  # seconds
 
+    def _launch_local_webpage_streamer(self):
+        """Start this bot's own webpage_streamer as a subprocess, off-Kubernetes.
+
+        Returns (process, base_url), or (None, None) if it could not be started - a
+        bot that cannot get a streamer up loses its screenshare capability, not its
+        meeting.
+        """
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        finally:
+            sock.close()
+
+        script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "webpage_streamer",
+            "run_webpage_streamer.py",
+        )
+
+        # A clean environment for the child: WEBPAGE_STREAMER_IS_SHARED cleared so its
+        # own idle-timeout watchdog runs in per-bot mode (it exits with this bot rather
+        # than just releasing a session and staying up for a fleet that isn't there),
+        # and DISPLAY cleared so it opens its own virtual display instead of inheriting
+        # whatever this bot process is already using for its own Selenium browser.
+        child_env = dict(os.environ)
+        child_env.pop("WEBPAGE_STREAMER_IS_SHARED", None)
+        child_env.pop("DISPLAY", None)
+        child_env["WEBPAGE_STREAMER_PORT"] = str(port)
+
+        try:
+            process = subprocess.Popen(
+                [sys.executable, script],
+                env=child_env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as e:
+            logger.error(f"Bot {self.bot_in_db.id}: could not start local webpage streamer: {e}")
+            return None, None
+
+        logger.info(f"Bot {self.bot_in_db.id}: started local webpage streamer on port {port} (pid {process.pid})")
+        return process, f"http://127.0.0.1:{port}"
+
+    def _cleanup_local_webpage_streamer_process(self):
+        """Terminate this bot's own local streamer subprocess, if one was started.
+
+        Belt-and-suspenders over the /shutdown POST WebpageStreamerManager.cleanup()
+        already sent: this process is ours alone (off-Kubernetes per-bot mode), so
+        nothing else depends on it staying up, and owning the handle directly means an
+        unresponsive HTTP server can't leak it the way it could when nothing but a
+        network call could reach it.
+        """
+        process, self._local_webpage_streamer_process = self._local_webpage_streamer_process, None
+        if process is None:
+            return
+
+        logger.info(f"Terminating local webpage streamer (pid {process.pid})...")
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.warning("Local webpage streamer did not exit after terminate(), killing it")
+            process.kill()
+            process.wait(timeout=10)
+
     def run(self):
         if self.run_called:
             raise Exception("Run already called, exiting")
@@ -993,20 +1065,36 @@ class BotController:
         )
 
         self.webpage_streamer_manager = None
+        self._local_webpage_streamer_process = None
         if self.bot_in_db.should_launch_webpage_streamer():
-            self.webpage_streamer_manager = WebpageStreamerManager(
-                is_bot_ready_for_webpage_streamer_callback=self.adapter.is_bot_ready_for_webpage_streamer,
-                get_peer_connection_offer_callback=self.adapter.webpage_streamer_get_peer_connection_offer,
-                start_peer_connection_callback=self.adapter.webpage_streamer_start_peer_connection,
-                play_bot_output_media_stream_callback=self.adapter.webpage_streamer_play_bot_output_media_stream,
-                stop_bot_output_media_stream_callback=self.adapter.webpage_streamer_stop_bot_output_media_stream,
-                on_message_that_webpage_streamer_connection_can_start_callback=self.on_message_that_webpage_streamer_connection_can_start,
-                webpage_streamer_service_hostname=self.bot_in_db.k8s_webpage_streamer_service_hostname(),
-            )
-            # The one hook that points back at the manager: an adapter that can see the
-            # stream is not delivering needs a way to say so.
-            self.adapter.set_webpage_streamer_restart_callback(self.webpage_streamer_manager.restart_stream)
-            self.webpage_streamer_manager.init()
+            running_in_kubernetes = os.getenv("LAUNCH_BOT_METHOD") == "kubernetes"
+            webpage_streamer_base_url = None
+            if not running_in_kubernetes:
+                # Kubernetes already gives every bot pod its own streamer pod
+                # (bot_pod_creator.py). Off-Kubernetes - celery workers sharing one
+                # Railway replica - "one per bot" has to mean one OS process on a port
+                # nobody else in this container is using, so this bot spawns and owns
+                # its own rather than reaching for a hostname shared by the fleet.
+                self._local_webpage_streamer_process, webpage_streamer_base_url = self._launch_local_webpage_streamer()
+
+            if running_in_kubernetes or webpage_streamer_base_url:
+                self.webpage_streamer_manager = WebpageStreamerManager(
+                    is_bot_ready_for_webpage_streamer_callback=self.adapter.is_bot_ready_for_webpage_streamer,
+                    get_peer_connection_offer_callback=self.adapter.webpage_streamer_get_peer_connection_offer,
+                    start_peer_connection_callback=self.adapter.webpage_streamer_start_peer_connection,
+                    play_bot_output_media_stream_callback=self.adapter.webpage_streamer_play_bot_output_media_stream,
+                    stop_bot_output_media_stream_callback=self.adapter.webpage_streamer_stop_bot_output_media_stream,
+                    on_message_that_webpage_streamer_connection_can_start_callback=self.on_message_that_webpage_streamer_connection_can_start,
+                    webpage_streamer_service_hostname=self.bot_in_db.k8s_webpage_streamer_service_hostname(),
+                    webpage_streamer_base_url=webpage_streamer_base_url,
+                )
+                # The one hook that points back at the manager: an adapter that can see
+                # the stream is not delivering needs a way to say so.
+                self.adapter.set_webpage_streamer_restart_callback(self.webpage_streamer_manager.restart_stream)
+                self.webpage_streamer_manager.init()
+            # Off-Kubernetes and the local streamer would not start: no manager, no
+            # screenshare for this bot - not a wedged bot waiting on a process that
+            # will never answer.
 
         self.bot_resource_snapshot_taker = BotResourceSnapshotTaker(self.bot_in_db)
 

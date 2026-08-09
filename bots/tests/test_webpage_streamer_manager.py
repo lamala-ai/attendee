@@ -82,6 +82,44 @@ class TestWebpageStreamerManagerStreamingServiceHostname(TestCase):
         self.assertEqual(result, "attendee-webpage-streamer-local")
 
 
+class TestWebpageStreamerManagerBaseUrl(TestCase):
+    """Tests for base_url(), the one place every request's address is built."""
+
+    def _create_manager(self, **kwargs):
+        return WebpageStreamerManager(
+            is_bot_ready_for_webpage_streamer_callback=MagicMock(),
+            get_peer_connection_offer_callback=MagicMock(),
+            start_peer_connection_callback=MagicMock(),
+            play_bot_output_media_stream_callback=MagicMock(),
+            stop_bot_output_media_stream_callback=MagicMock(),
+            on_message_that_webpage_streamer_connection_can_start_callback=MagicMock(),
+            webpage_streamer_service_hostname="k8s-service-hostname",
+            **kwargs,
+        )
+
+    def test_falls_back_to_hostname_and_port_8000_when_no_override(self):
+        """Today's Kubernetes and shared-service deployments never pass an override, so
+        this is the path that must keep working unchanged."""
+        manager = self._create_manager()
+        with patch.dict(os.environ, {"LAUNCH_BOT_METHOD": "kubernetes"}):
+            self.assertEqual(manager.base_url(), "http://k8s-service-hostname:8000")
+
+    def test_explicit_override_wins_over_the_hostname_convention(self):
+        """The off-Kubernetes per-bot launcher passes a base_url pointing at its own
+        subprocess's port - streaming_service_hostname()'s fixed :8000 has no way to
+        express that, so an override takes over entirely rather than being merged in."""
+        manager = self._create_manager(webpage_streamer_base_url="http://127.0.0.1:54321")
+        self.assertEqual(manager.base_url(), "http://127.0.0.1:54321")
+
+    def test_override_is_used_in_a_real_request(self):
+        manager = self._create_manager(webpage_streamer_base_url="http://127.0.0.1:54321")
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        with patch("bots.bot_controller.webpage_streamer_manager.requests.post", return_value=mock_response) as mock_post:
+            manager.update_webrtc_connection("https://example.com")
+        mock_post.assert_called_once_with("http://127.0.0.1:54321/start_streaming", json={"url": "https://example.com"})
+
+
 class TestWebpageStreamerManagerUpdate(TestCase):
     """Tests for the update method."""
 

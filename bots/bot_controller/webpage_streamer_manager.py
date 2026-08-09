@@ -18,6 +18,7 @@ class WebpageStreamerManager:
         stop_bot_output_media_stream_callback,
         on_message_that_webpage_streamer_connection_can_start_callback,
         webpage_streamer_service_hostname,
+        webpage_streamer_base_url=None,
     ):
         self.url = None
         self.last_non_empty_url = None
@@ -26,6 +27,11 @@ class WebpageStreamerManager:
         self.start_peer_connection_callback = start_peer_connection_callback
         self.cleaned_up = False
         self.webpage_streamer_service_hostname = webpage_streamer_service_hostname
+        # Set only by the off-Kubernetes per-bot launcher, which owns a subprocess on a
+        # port it picked itself - streaming_service_hostname()'s hostname:8000
+        # convention has no way to say that, so this overrides it outright rather than
+        # trying to make that method aware of a port that varies per instance.
+        self.webpage_streamer_base_url = webpage_streamer_base_url
         self.is_bot_ready_for_webpage_streamer_callback = is_bot_ready_for_webpage_streamer_callback
         self.play_bot_output_media_stream_callback = play_bot_output_media_stream_callback
         self.stop_bot_output_media_stream_callback = stop_bot_output_media_stream_callback
@@ -97,9 +103,14 @@ class WebpageStreamerManager:
         # an environment variable defaulting to the compose name, which leaves compose unchanged.
         return os.getenv("WEBPAGE_STREAMER_HOSTNAME", "attendee-webpage-streamer-local")
 
+    def base_url(self):
+        if self.webpage_streamer_base_url:
+            return self.webpage_streamer_base_url
+        return f"http://{self.streaming_service_hostname()}:8000"
+
     def update_webrtc_connection(self, url):
         # Start and update do the same thing, so we can use the same endpoint
-        update_streaming_response = requests.post(f"http://{self.streaming_service_hostname()}:8000/start_streaming", json={"url": url})
+        update_streaming_response = requests.post(f"{self.base_url()}/start_streaming", json={"url": url})
         logger.info(f"Update streaming response: {update_streaming_response}")
 
         if update_streaming_response.status_code != 200:
@@ -117,7 +128,7 @@ class WebpageStreamerManager:
             logger.error(f"Error getting peer connection offer: {peerConnectionOffer.get('error')}, returning")
             return
 
-        offer_response = requests.post(f"http://{self.streaming_service_hostname()}:8000/offer", json={"sdp": peerConnectionOffer["sdp"], "type": peerConnectionOffer["type"]}, timeout=30)
+        offer_response = requests.post(f"{self.base_url()}/offer", json={"sdp": peerConnectionOffer["sdp"], "type": peerConnectionOffer["type"]}, timeout=30)
         # Checked before parsing: the streamer answers a failed offer with a 500 whose
         # body is a plain traceback, so calling .json() on it raises a JSONDecodeError
         # that buries the actual error under a parsing one.
@@ -127,7 +138,7 @@ class WebpageStreamerManager:
         logger.info(f"Offer response: {offer_response.json()}")
         self.start_peer_connection_callback(offer_response.json())
 
-        start_streaming_response = requests.post(f"http://{self.streaming_service_hostname()}:8000/start_streaming", json={"url": url})
+        start_streaming_response = requests.post(f"{self.base_url()}/start_streaming", json={"url": url})
         logger.info(f"Start streaming response: {start_streaming_response}")
 
         if start_streaming_response.status_code != 200:
@@ -185,7 +196,7 @@ class WebpageStreamerManager:
                 # an address family it does not bind - hangs this thread on its first
                 # call for ever. That is indistinguishable from a healthy quiet loop:
                 # no keepalive line, no error line, and a share that never starts.
-                response = requests.post(f"http://{self.streaming_service_hostname()}:8000/keepalive", json={}, timeout=10)
+                response = requests.post(f"{self.base_url()}/keepalive", json={}, timeout=10)
                 logger.info(f"Webpage streamer keepalive response: {response.status_code}")
                 if response.status_code == 200 and not self.webpage_streamer_connection_can_start:
                     bot_is_ready_for_webpage_streamer = self.is_bot_ready_for_webpage_streamer_callback()
@@ -211,7 +222,7 @@ class WebpageStreamerManager:
             logger.info("Not shutting the webpage streamer down: it is shared with other bots")
             return
         try:
-            response = requests.post(f"http://{self.streaming_service_hostname()}:8000/shutdown", json={}, timeout=10)
+            response = requests.post(f"{self.base_url()}/shutdown", json={}, timeout=10)
             logger.info(f"Webpage streamer shutdown response: {response.json()}")
         except Exception as e:
             logger.info(f"Webpage streamer shutdown response: {e}")
