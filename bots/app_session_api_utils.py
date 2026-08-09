@@ -16,6 +16,7 @@ from .models import (
     Project,
     Recording,
     SessionTypes,
+    TranscriptionProviders,
     TranscriptionTypes,
 )
 from .utils import transcription_provider_from_bot_creation_data
@@ -78,11 +79,12 @@ def create_app_session(data: dict, source: BotCreationSource, project: Project) 
                 session_type=SessionTypes.APP_SESSION,
             )
 
+            transcription_provider = transcription_provider_from_bot_creation_data(serializer.validated_data)
             Recording.objects.create(
                 bot=app_session,
                 recording_type=app_session.recording_type(),
-                transcription_type=TranscriptionTypes.NON_REALTIME,
-                transcription_provider=transcription_provider_from_bot_creation_data(serializer.validated_data),
+                transcription_type=TranscriptionTypes.NO_TRANSCRIPTION if transcription_provider == TranscriptionProviders.NO_TRANSCRIPTION else TranscriptionTypes.NON_REALTIME,
+                transcription_provider=transcription_provider,
                 is_default_recording=True,
             )
 

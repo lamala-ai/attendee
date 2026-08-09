@@ -259,6 +259,12 @@ BOT_IMAGE_SCHEMA = {
 TRANSCRIPTION_SETTINGS_SCHEMA = {
     "type": "object",
     "properties": {
+        "none": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+            "description": "Turn transcription off entirely. No utterances are created and nothing is sent to a transcription provider. Use this when the audio is being transcribed outside Attendee (for example over the per-participant audio websocket) - otherwise the default provider runs, and without credentials it fails once per utterance for the whole meeting.",
+        },
         "deepgram": {
             "type": "object",
             "properties": {
@@ -1170,6 +1176,12 @@ class CreateAsyncTranscriptionSerializer(serializers.Serializer):
 
         if "meeting_closed_captions" in value:
             raise serializers.ValidationError({"transcription_settings": "Meeting closed captions are not available for async transcription."})
+
+        # An async transcription is something you asked for on purpose, so "none" here is
+        # a contradiction rather than a setting - and left to the worker it would come
+        # back as an internal error, once per utterance.
+        if "none" in value:
+            raise serializers.ValidationError({"transcription_settings": "Please specify a transcription provider. Transcription cannot be turned off for an async transcription."})
 
         if value.get("deepgram", {}).get("callback"):
             raise serializers.ValidationError({"transcription_settings": "Deepgram callback is not available for async transcription."})

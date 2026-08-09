@@ -155,6 +155,11 @@ class ZoomBotAdapter(BotAdapter):
         self.silence_detection_activated = False
         self.cleaned_up = False
         self.requested_leave = False
+        # Zoom takes the virtual camera down with the meeting, and it does not tell the
+        # sender. Everything we hand the video sender after that point comes back
+        # SDKERR_WRONG_USAGE, so the one thing that does know - the meeting status
+        # callback - writes it down here.
+        self.meeting_ended = False
         self.joined_at = None
         self.is_webinar = False
 
@@ -456,6 +461,21 @@ class ZoomBotAdapter(BotAdapter):
                         bin_end = (bin_idx + 1) * bin_size
                         logger.info(f"{bin_start:6.0f} - {bin_end:6.0f} us: {count:5d} calls")
 
+        # Every raw-data subscription goes before the services do. Unsubscribing runs
+        # through the meeting service, so doing it afterwards asks a destroyed object to
+        # let go of something and gets "audio_helper.unSubscribe() returned
+        # SDKERR_INTERNAL_ERROR" - which reads like the audio path failed when in fact
+        # nothing was wrong except the order we took it apart in.
+        if self.audio_helper:
+            audio_helper_unsubscribe_result = self.audio_helper.unSubscribe()
+            logger.info(f"audio_helper.unSubscribe() returned {audio_helper_unsubscribe_result}")
+
+        if self.video_input_manager:
+            self.video_input_manager.cleanup()
+
+        if self.realtime_per_participant_video_frame_generator:
+            self.realtime_per_participant_video_frame_generator.reset()
+
         if self.meeting_service:
             zoom.DestroyMeetingService(self.meeting_service)
             logger.info("Destroyed Meeting service")
@@ -465,13 +485,6 @@ class ZoomBotAdapter(BotAdapter):
         if self.auth_service:
             zoom.DestroyAuthService(self.auth_service)
             logger.info("Destroyed Auth service")
-
-        if self.audio_helper:
-            audio_helper_unsubscribe_result = self.audio_helper.unSubscribe()
-            logger.info(f"audio_helper.unSubscribe() returned {audio_helper_unsubscribe_result}")
-
-        if self.video_input_manager:
-            self.video_input_manager.cleanup()
 
         logger.info("CleanUPSDK() called")
         zoom.CleanUPSDK()
@@ -821,7 +834,7 @@ class ZoomBotAdapter(BotAdapter):
             self.send_image_timeout_id = GLib.timeout_add(presence_indicator.FRAME_INTERVAL_MS, self.send_current_image_to_zoom)
 
     def send_current_image_to_zoom(self):
-        if self.requested_leave or self.cleaned_up or (not self.current_raw_image_to_send):
+        if self.requested_leave or self.cleaned_up or self.meeting_ended or (not self.current_raw_image_to_send):
             self.send_image_timeout_id = None
             return False
 
@@ -897,7 +910,7 @@ class ZoomBotAdapter(BotAdapter):
             self.send_current_image_to_zoom()
 
     def send_video_frame_to_zoom(self, yuv420_image_bytes, original_width, original_height):
-        if self.requested_leave or self.cleaned_up or (not self.suggested_video_cap):
+        if self.requested_leave or self.cleaned_up or self.meeting_ended or (not self.suggested_video_cap):
             return False
 
         # Only scale if the dimensions are different
@@ -1184,7 +1197,18 @@ class ZoomBotAdapter(BotAdapter):
             self.send_message_callback({"message": self.Messages.WEBINAR_BOT_PROMOTED_TO_PANELIST})
 
         if status == zoom.MEETING_STATUS_INMEETING:
+            # A retry after a failed join, or a second meeting on the same process, gets
+            # a live video source again.
+            self.meeting_ended = False
             self.send_message_callback({"message": self.Messages.BOT_JOINED_MEETING})
+
+        if status == zoom.MEETING_STATUS_ENDED or status == zoom.MEETING_STATUS_FAILED:
+            # Recorded before anything else acts on the status, because the frame timer
+            # can fire between here and cleanup(). Without this the last tick of the
+            # meeting sends into a video source Zoom has already destroyed and logs
+            # "send_current_image_to_zoom failed with ... SDKERR_WRONG_USAGE" - a line
+            # that says a live meeting is broken, printed after the meeting is over.
+            self.meeting_ended = True
 
         if status == zoom.MEETING_STATUS_ENDED:
             if self.should_retry_after_meeting_ends:

@@ -93,6 +93,9 @@ class BotController:
     # Default wait time for utterance termination (5 minutes)
     UTTERANCE_TERMINATION_WAIT_TIME_SECONDS = 300
 
+    # Long enough for the listener to come back from one get_message(timeout=1.0).
+    REDIS_LISTENER_SHUTDOWN_TIMEOUT_SECONDS = 3
+
     def use_streaming_transcription(self):
         provider = self.get_recording_transcription_provider()
         if provider == TranscriptionProviders.KYUTAI:
@@ -109,7 +112,8 @@ class BotController:
             return self.per_participant_non_streaming_audio_input_manager
 
     def save_utterances_for_individual_audio_chunks(self):
-        return self.get_recording_transcription_provider() != TranscriptionProviders.CLOSED_CAPTION_FROM_PLATFORM
+        provider = self.get_recording_transcription_provider()
+        return provider != TranscriptionProviders.CLOSED_CAPTION_FROM_PLATFORM and provider != TranscriptionProviders.NO_TRANSCRIPTION
 
     def save_utterances_for_closed_captions(self):
         return self.get_recording_transcription_provider() == TranscriptionProviders.CLOSED_CAPTION_FROM_PLATFORM
@@ -741,6 +745,7 @@ class BotController:
         self.redis_client = None
         self.pubsub = None
         self.pubsub_channel = f"bot_{self.bot_in_db.id}"
+        self.redis_listener_should_stop = threading.Event()
 
         self.automatic_leave_configuration = AutomaticLeaveConfiguration(**self.bot_in_db.automatic_leave_settings())
 
@@ -829,6 +834,44 @@ class BotController:
             return False
 
         return not self.should_create_gstreamer_pipeline()
+
+    def repeatedly_try_to_reconnect_to_redis(self):
+        reconnect_delay_seconds = 1
+        num_attempts = 0
+        while True:
+            try:
+                self.connect_to_redis()
+                break
+            except Exception as e:
+                logger.warning(f"Error reconnecting to Redis: {e} Attempt {num_attempts} / 30.")
+                time.sleep(reconnect_delay_seconds)
+                num_attempts += 1
+                if num_attempts > 30:
+                    raise Exception("Failed to reconnect to Redis after 30 attempts")
+
+    def redis_listener(self):
+        while not self.redis_listener_should_stop.is_set():
+            try:
+                message = self.pubsub.get_message(timeout=1.0)
+                if message:
+                    # Schedule Redis message handling in the main GLib loop
+                    GLib.idle_add(self.handle_redis_message, message)
+            except Exception as e:
+                # Asked to stop, so whatever the read hit on the way out is the shutdown
+                # itself and not a fault worth a warning.
+                if self.redis_listener_should_stop.is_set():
+                    logger.info("Redis listener stopping because the bot is shutting down")
+                    break
+
+                # If this is a certain type of exception, we can attempt to reconnect
+                if isinstance(e, redis.exceptions.ConnectionError) and "Connection closed by server." in str(e):
+                    logger.info("Redis connection closed by server. Attempting to reconnect...")
+                    self.repeatedly_try_to_reconnect_to_redis()
+
+                else:
+                    # log the type of exception
+                    logger.warning(f"Error in Redis listener: {type(e)} {e}")
+                    break
 
     def connect_to_redis(self):
         # Close both pubsub and client if they exist
@@ -977,39 +1020,7 @@ class BotController:
         # Create GLib main loop
         self.main_loop = GLib.MainLoop()
 
-        def repeatedly_try_to_reconnect_to_redis():
-            reconnect_delay_seconds = 1
-            num_attempts = 0
-            while True:
-                try:
-                    self.connect_to_redis()
-                    break
-                except Exception as e:
-                    logger.warning(f"Error reconnecting to Redis: {e} Attempt {num_attempts} / 30.")
-                    time.sleep(reconnect_delay_seconds)
-                    num_attempts += 1
-                    if num_attempts > 30:
-                        raise Exception("Failed to reconnect to Redis after 30 attempts")
-
-        def redis_listener():
-            while True:
-                try:
-                    message = self.pubsub.get_message(timeout=1.0)
-                    if message:
-                        # Schedule Redis message handling in the main GLib loop
-                        GLib.idle_add(self.handle_redis_message, message)
-                except Exception as e:
-                    # If this is a certain type of exception, we can attempt to reconnect
-                    if isinstance(e, redis.exceptions.ConnectionError) and "Connection closed by server." in str(e):
-                        logger.info("Redis connection closed by server. Attempting to reconnect...")
-                        repeatedly_try_to_reconnect_to_redis()
-
-                    else:
-                        # log the type of exception
-                        logger.warning(f"Error in Redis listener: {type(e)} {e}")
-                        break
-
-        redis_thread = threading.Thread(target=redis_listener, daemon=True)
+        redis_thread = threading.Thread(target=self.redis_listener, daemon=True)
         redis_thread.start()
 
         # Add timeout just for audio processing
@@ -1027,6 +1038,14 @@ class BotController:
             logger.warning(f"Error in bot {self.bot_in_db.id}: {str(e)}")
             self.cleanup()
         finally:
+            # Stop the listener before the socket it is reading disappears. Closing the
+            # pubsub underneath a blocked get_message() kills the thread with
+            # "Error in Redis listener: <class 'ValueError'> I/O operation on closed file"
+            # seconds after the meeting ended - an alarming line about Redis in the logs
+            # of an incident that had nothing to do with Redis.
+            self.redis_listener_should_stop.set()
+            redis_thread.join(timeout=self.REDIS_LISTENER_SHUTDOWN_TIMEOUT_SECONDS)
+
             # Clean up Redis subscription
             self.pubsub.unsubscribe(self.pubsub_channel)
             self.pubsub.close()

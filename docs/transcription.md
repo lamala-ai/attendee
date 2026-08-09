@@ -145,3 +145,27 @@ Example: `OPENAI_BASE_URL=https://your-proxy.com/v1` and `OPENAI_MODEL_NAME=whis
 ### Custom Async (Bring Your Own Platform)
 
 For Attendee self-hosters only. Lets you use your own self-hosted transcription service. See the [Custom Async Transcription](https://github.com/attendee-labs/attendee/blob/main/docs/custom_async_transcription.md) page for more details.
+## No transcription
+
+A bot that transcribes elsewhere - typically because it is consuming the
+per-participant audio websocket and running its own speech-to-text - should say so when
+it is created:
+
+```json
+{
+  "meeting_url": "https://us02web.zoom.us/j/...",
+  "transcription_settings": { "none": {} }
+}
+```
+
+Otherwise the platform default applies (Deepgram for Zoom on the native SDK, closed
+captions for Google Meet and Teams) and the bot cuts an utterance per turn, stores the
+audio and queues a transcription task for it. Where the project has no credentials for
+that provider, every one of those tasks fails with `credentials_not_found` - once per
+thing anybody says.
+
+With `none`, no utterances are created and nothing is sent to a provider. The
+per-participant audio websocket and the recording are unaffected, and so is
+`recording_settings.record_async_transcription_audio_chunks`: keep the chunks and you
+can still transcribe the meeting afterwards by asking for an async transcription that
+names a real provider.
