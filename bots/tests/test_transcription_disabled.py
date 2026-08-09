@@ -88,7 +88,7 @@ class TheApiAcceptsIt(TestCase):
         self.assertIn("transcription_settings", serializer.errors)
 
     def test_an_async_transcription_naming_a_provider_is_still_fine(self):
-        serializer = CreateAsyncTranscriptionSerializer(data={"transcription_settings": {"openai": {}}})
+        serializer = CreateAsyncTranscriptionSerializer(data={"transcription_settings": {"deepgram": {"language": "multi"}}})
         self.assertTrue(serializer.is_valid(), serializer.errors)
 
 

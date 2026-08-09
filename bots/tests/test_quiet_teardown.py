@@ -28,7 +28,7 @@ decided:
 """
 
 import threading
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase
 
@@ -198,16 +198,26 @@ class CleanupReleasesBeforeItDestroys(SimpleTestCase):
 
         self.adapter = an_adapter()
 
-        # One recorder, so the assertions are about order and not about counts.
-        self.order = MagicMock()
+        # One recorder, so the assertions are about order and not about counts. A plain
+        # list rather than a parent mock: unSubscribe()'s result is logged, and a mock
+        # would record the __str__ of its own return value as another call.
+        self.order = []
+
+        def record(what, result=None):
+            def note(*args, **kwargs):
+                self.order.append(what)
+                return result
+
+            return note
+
         self.adapter.audio_helper = MagicMock()
-        self.adapter.audio_helper.unSubscribe.side_effect = lambda: self.order.unsubscribed_audio()
+        self.adapter.audio_helper.unSubscribe.side_effect = record("unsubscribed audio", SDKERR_SUCCESS)
         self.adapter.video_input_manager = MagicMock()
-        self.adapter.video_input_manager.cleanup.side_effect = lambda: self.order.cleaned_up_video()
+        self.adapter.video_input_manager.cleanup.side_effect = record("cleaned up video")
         self.adapter.realtime_per_participant_video_frame_generator = MagicMock()
-        self.adapter.realtime_per_participant_video_frame_generator.reset.side_effect = lambda: self.order.stopped_the_refresh()
+        self.adapter.realtime_per_participant_video_frame_generator.reset.side_effect = record("stopped the refresh")
         self.adapter.meeting_service = MagicMock()
-        self.zoom.DestroyMeetingService.side_effect = lambda service: self.order.destroyed_the_meeting_service()
+        self.zoom.DestroyMeetingService.side_effect = record("destroyed the meeting service")
 
     def test_audio_is_unsubscribed_before_the_meeting_service_is_destroyed(self):
         """Fails against the old behaviour, where unSubscribe() ran through a meeting
@@ -215,12 +225,12 @@ class CleanupReleasesBeforeItDestroys(SimpleTestCase):
         self.adapter.cleanup()
 
         self.assertEqual(
-            self.order.mock_calls,
+            self.order,
             [
-                call.unsubscribed_audio(),
-                call.cleaned_up_video(),
-                call.stopped_the_refresh(),
-                call.destroyed_the_meeting_service(),
+                "unsubscribed audio",
+                "cleaned up video",
+                "stopped the refresh",
+                "destroyed the meeting service",
             ],
         )
 
