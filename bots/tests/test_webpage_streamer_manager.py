@@ -207,6 +207,7 @@ class TestWebpageStreamerManagerStartOrUpdateWebrtcConnection(TestCase):
         manager.get_peer_connection_offer_callback.return_value = {"sdp": "offer-sdp", "type": "offer"}
 
         mock_offer_response = MagicMock()
+        mock_offer_response.status_code = 200
         mock_offer_response.json.return_value = {"sdp": "answer-sdp", "type": "answer"}
 
         mock_start_response = MagicMock()
@@ -238,6 +239,7 @@ class TestWebpageStreamerManagerStartOrUpdateWebrtcConnection(TestCase):
         manager.get_peer_connection_offer_callback.return_value = {"sdp": "offer-sdp", "type": "offer"}
 
         mock_offer_response = MagicMock()
+        mock_offer_response.status_code = 200
         mock_offer_response.json.return_value = {"sdp": "answer-sdp", "type": "answer"}
 
         mock_start_response = MagicMock()
@@ -248,6 +250,9 @@ class TestWebpageStreamerManagerStartOrUpdateWebrtcConnection(TestCase):
         manager.start_or_update_webrtc_connection("http://example.com")
 
         self.assertFalse(manager.webrtc_connection_started)
+        # Both calls, so this cannot go back to passing because the offer was refused
+        # before /start_streaming was ever reached - which is what it was doing.
+        self.assertEqual(mock_post.call_count, 2)
 
     @patch("bots.bot_controller.webpage_streamer_manager.requests.post")
     def test_update_webrtc_connection_when_already_started(self, mock_post):

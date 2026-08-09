@@ -291,9 +291,7 @@ class WebpageStreamerShareSource:
             onStartSendAudioCallback=self.on_share_start_send_audio_callback,
             onStopSendAudioCallback=self.on_share_stop_send_audio_callback,
         )
-        result = self.share_source_helper.setExternalShareSource(
-            self.share_source_callbacks, self.share_audio_callbacks
-        )
+        result = self.share_source_helper.setExternalShareSource(self.share_source_callbacks, self.share_audio_callbacks)
         logger.info(f"setExternalShareSource result = {result}")
         if result != zoom.SDKERR_SUCCESS:
             logger.info("Failed to set the external share source, the room will not see the page")
