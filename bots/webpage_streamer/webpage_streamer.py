@@ -39,25 +39,73 @@ def streamer_is_shared():
     return os.getenv("WEBPAGE_STREAMER_IS_SHARED", "").strip().lower() in ("1", "true", "yes")
 
 
+# How long a capture that has reached PLAYING may produce nothing before it is worth a
+# line in the log. Frames come at 15/s, so anything past a couple of seconds is already
+# a stall; five keeps a loaded box from being accused of one.
+VIDEO_STALL_DEADLINE_SECONDS = 5
+
+
 class GstVideoStreamTrack(MediaStreamTrack):
     kind = "video"
 
-    def __init__(self, sink, width, height, framerate=15):
+    def __init__(self, sink, width, height, framerate=15, pipeline=None):
         super().__init__()
         self._sink = sink
         self._width = width
         self._height = height
         self._framerate = framerate
         self._base_pts_ns = None
+        # Only to be asked what it objected to. A pipeline that fails *after* reaching
+        # PLAYING says so on its bus and nowhere else, and nothing was reading the bus
+        # once startup was over - see _stall_reason.
+        self._pipeline = pipeline
+        self._frames = 0
+        self._stalled = False
 
     def _pull_sample(self):
-        return self._sink.emit("pull-sample")
+        """One sample, or None if the source produced nothing for the deadline.
+
+        try-pull-sample rather than pull-sample, which blocks for ever. That is the
+        whole bug this addresses: on 2026-08-09 a Zoom share sat on a connected peer
+        connection for 76 seconds and delivered zero frames, and because the pull never
+        returned and nothing watched the bus, the streamer logged not one line about it.
+        The receiving half could say the room was seeing nothing (it counts frames); the
+        sending half could not say why, which is the half that knows.
+        """
+        return self._sink.emit("try-pull-sample", VIDEO_STALL_DEADLINE_SECONDS * Gst.SECOND)
+
+    def _stall_reason(self):
+        """Whatever the pipeline objected to since anyone last asked, as a sentence."""
+        if self._pipeline is None:
+            return ""
+        bus = self._pipeline.get_bus()
+        message = bus.timed_pop_filtered(0, Gst.MessageType.ERROR | Gst.MessageType.EOS)
+        if message is None:
+            return ""
+        if message.type == Gst.MessageType.EOS:
+            return "the pipeline reached end-of-stream"
+        error, debug = message.parse_error()
+        return f"{error.message} [{debug}]"
 
     async def recv(self) -> VideoFrame:
         loop = asyncio.get_running_loop()
-        sample = await loop.run_in_executor(None, self._pull_sample)
-        if sample is None:
-            raise asyncio.CancelledError("Video pipeline ended")
+        while True:
+            sample = await loop.run_in_executor(None, self._pull_sample)
+            if sample is not None:
+                break
+            reason = self._stall_reason()
+            if reason:
+                # A dead pipeline is worth ending the track over: the receiver is
+                # waiting on recv() and would otherwise wait for the length of the
+                # meeting. Ended, it logs that the track ended and clears its frame.
+                logger.error(f"The capture pipeline stopped delivering video and will not recover: {reason}")
+                raise asyncio.CancelledError(f"Video pipeline failed: {reason}")
+            if not self._stalled:
+                self._stalled = True
+                logger.warning(f"No video captured in {VIDEO_STALL_DEADLINE_SECONDS}s and the pipeline reports no error ({self._frames} frames sent so far). Anything receiving this share is seeing a frozen or black picture; the display is being captured but is producing nothing.")
+        if self._stalled:
+            logger.info("Video capture recovered and is producing frames again")
+            self._stalled = False
 
         buffer = sample.get_buffer()
         pts_ns = buffer.pts
@@ -93,6 +141,13 @@ class GstVideoStreamTrack(MediaStreamTrack):
         # Reuse the same μs time base as audio for nice alignment
         frame.time_base = Fraction(1, 1_000_000)
         frame.pts = rel_ns // 1_000
+
+        self._frames += 1
+        if self._frames == 1:
+            # The counterpart of "First video frame received from the webpage streamer"
+            # on the bot. With both lines present the two halves can be told apart from
+            # the logs alone: this one and not that one is WebRTC, neither is capture.
+            logger.info(f"First video frame captured and sent: {self._width}x{self._height}")
 
         return frame
 
@@ -283,6 +338,10 @@ class WebpageStreamer:
             width=width,
             height=height,
             framerate=15,
+            # So a stall can ask what the pipeline objected to. Nothing else reads the
+            # bus once PLAYING has been reached, which is how a pipeline that died
+            # mid-share stayed silent for the length of one.
+            pipeline=pipeline,
         )
         self._audio_track = GstAudioStreamTrack(sink=self._gst_audio_sink, sample_rate=16000, channels=1) if self._gst_audio_sink else None
 
