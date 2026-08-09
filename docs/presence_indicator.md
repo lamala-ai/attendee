@@ -49,10 +49,15 @@ Everything is measured off the *picture*, not the frame: a square avatar scaled 
 black bars beside the portrait instead of the face.
 
 Within the picture, the lit band of the glow rides at 0.44 of the shorter side out from
-the middle and the label sits above the bottom by about the same margin — both inside the
+the middle and the label's plate is lifted clear of the bottom edge — both inside the
 circle a square picture survives being cropped to, because meeting clients crop tiles to
 fill and an indicator that can be cropped away is worse than none. The halo either side
 of the band may cross that circle; it is already fading to nothing out there.
+
+The bottom of a tile is also where the meeting client writes the participant's own name,
+so the plate is kept up out of that band rather than pushed to the last pixel a crop
+would leave, and sized to read as part of the picture rather than as a second caption
+over the client's own.
 
 Colours, periods, words and geometry live in `bots/presence_indicator.py`; the web
 adapters repeat them at the top of `bots/web_bot_adapter/shared_chromedriver_payload.js`

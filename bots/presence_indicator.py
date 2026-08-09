@@ -25,10 +25,15 @@ somebody who was never told.
 **Where things are allowed to sit.** Meeting clients crop a tile to fill their own
 shape, so an indicator pushed to the edge of the picture is one that can be cropped
 away - which is worse than no indicator at all. The lit band of the glow rides at 0.44
-of the shorter side out from the middle and the label sits above the bottom by roughly
-the same margin, so both survive the circle a square picture is cropped to. What can
+of the shorter side out from the middle, and the label's plate is lifted clear of the
+bottom edge, so both survive the circle a square picture is cropped to. What can
 extend past that circle is the halo either side of the band, and only its faintest
 part: it is already fading to nothing there, so a crop takes nothing readable with it.
+
+The bottom of a tile is also where the meeting client writes the participant's own
+name, so the label is kept up out of that band rather than pushed to the last pixel a
+crop would leave: an indicator sitting on top of the client's own caption is legible
+and still wrong.
 
 The important property is that **nothing is sent per frame**. The state is set once and
 the bot animates its own tile from the frames it already emits: the Zoom adapter paints
@@ -91,9 +96,15 @@ RING_BLOOM_ALPHA = 0.42
 # The label's plate: a pill, wide enough for the longest word and high enough to sit
 # clear of it. Positioned by its bottom edge, inset far enough up that its corners stay
 # inside the same circle the glow does.
-LABEL_WIDTH = 0.50
-LABEL_HEIGHT = 0.13
-LABEL_INSET = 0.085
+#
+# It used to be half the width of the picture and to sit almost on its bottom edge,
+# which put it exactly where a meeting client draws the participant's name - two labels
+# stacked on one tile, one of them ours. Smaller and lifted clear of that band: the word
+# is still the largest thing after the face, and it now reads as belonging to the
+# picture rather than competing with the client's own chrome.
+LABEL_WIDTH = 0.42
+LABEL_HEIGHT = 0.105
+LABEL_INSET = 0.16
 # Of the plate's own box: how much of it the glyphs may fill, leaving the rest as the
 # padding that makes a pill read as a plate rather than as a box round some letters.
 LABEL_FILL_WIDTH = 0.78
