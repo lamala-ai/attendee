@@ -936,11 +936,15 @@ class BotController:
         child_env["WEBPAGE_STREAMER_PORT"] = str(port)
 
         try:
+            # No stdout/stderr redirection: whatever this subprocess logs (its own
+            # "starting up", and - the whole point - whatever Chrome, GStreamer or the
+            # virtual display says when startup fails) has to reach this deployment's
+            # log stream, not disappear. A silent subprocess and a healthy one that
+            # just hasn't answered /keepalive yet look identical from here, and 2026-08-09
+            # spent several minutes indistinguishable from the other.
             process = subprocess.Popen(
                 [sys.executable, script],
                 env=child_env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
             )
         except OSError as e:
             logger.error(f"Bot {self.bot_in_db.id}: could not start local webpage streamer: {e}")
