@@ -144,6 +144,9 @@ class ZoomBotAdapter(BotAdapter):
         # Built lazily: most bots are never asked to show anything, and it costs an
         # asyncio thread and a peer connection.
         self.webpage_streamer_share_source = None
+        # Set by the bot controller once the streamer manager exists, because the ask
+        # goes the other way round from every other webpage-streamer hook here.
+        self.webpage_streamer_restart_callback = None
 
         self.automatic_leave_configuration = automatic_leave_configuration
 
@@ -1367,8 +1370,12 @@ class ZoomBotAdapter(BotAdapter):
                 meeting_service=self.meeting_service,
                 schedule_on_main_thread=GLib.timeout_add,
                 unschedule_on_main_thread=GLib.source_remove,
+                request_restream=self.webpage_streamer_restart_callback,
             )
         return self.webpage_streamer_share_source
+
+    def set_webpage_streamer_restart_callback(self, callback):
+        self.webpage_streamer_restart_callback = callback
 
     def webpage_streamer_get_peer_connection_offer(self):
         return self._webpage_streamer_share_source().get_peer_connection_offer()

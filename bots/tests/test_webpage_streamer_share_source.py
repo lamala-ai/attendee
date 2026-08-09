@@ -80,14 +80,23 @@ class WebpageStreamerShareSourceTestCase(SimpleTestCase):
             new_callable=create_mock_zoom_sdk_for_sharing(self.helper),
         )
 
+    def announce_the_share(self):
+        """Get to a share Zoom has accepted, without the wait for a first frame.
+
+        The wait is what ``TestNotAnnouncingAShareWithNothingInIt`` is about. Everything
+        else here is about what happens once Zoom has taken the share, and going through
+        the wait to get there would only make those tests depend on it.
+        """
+        with self.zoom_patch():
+            self.share_source._begin_zoom_share()
+
 
 class TestRegisteringTheShareSource(WebpageStreamerShareSourceTestCase):
     def test_the_share_source_is_registered_with_an_audio_source_as_well(self):
         """The regression. One argument raises TypeError against the real binding, the
         share never starts, and the room sees nothing while everything upstream of this
         call reports success."""
-        with self.zoom_patch():
-            self.share_source.play_bot_output_media_stream("screenshare")
+        self.announce_the_share()
 
         self.assertEqual(len(self.helper.calls), 1)
         share_source, audio_source = self.helper.calls[0]
@@ -97,8 +106,7 @@ class TestRegisteringTheShareSource(WebpageStreamerShareSourceTestCase):
 
     def test_the_audio_source_is_held_so_the_sdk_pointer_stays_valid(self):
         """The SDK keeps a raw pointer to it; a local would be collected."""
-        with self.zoom_patch():
-            self.share_source.play_bot_output_media_stream("screenshare")
+        self.announce_the_share()
 
         self.assertIs(self.share_source.share_audio_callbacks, self.helper.calls[0][1])
 
@@ -106,8 +114,7 @@ class TestRegisteringTheShareSource(WebpageStreamerShareSourceTestCase):
         """Share audio is declined on purpose - sendShareAudio rejects every documented
         format on Linux and a rendered page has nothing to play. It is declined by
         supplying a silent source, which is not the same as omitting the argument."""
-        with self.zoom_patch():
-            self.share_source.play_bot_output_media_stream("screenshare")
+        self.announce_the_share()
 
         audio_source = self.share_source.share_audio_callbacks
         audio_source.onStartSendAudioCallback(MagicMock())  # must not raise or send
@@ -118,11 +125,12 @@ class TestRegisteringTheShareSource(WebpageStreamerShareSourceTestCase):
             self.share_source.play_bot_output_media_stream("webcam")
 
         self.assertEqual(self.helper.calls, [])
+        self.assertFalse(self.share_source._share_requested)
         self.assertFalse(self.share_source._sharing_started)
 
     def test_registering_twice_is_a_no_op(self):
+        self.announce_the_share()
         with self.zoom_patch():
-            self.share_source.play_bot_output_media_stream("screenshare")
             self.share_source.play_bot_output_media_stream("screenshare")
 
         self.assertEqual(len(self.helper.calls), 1)
@@ -130,7 +138,7 @@ class TestRegisteringTheShareSource(WebpageStreamerShareSourceTestCase):
     def test_a_missing_helper_gives_up_rather_than_raising(self):
         with self.zoom_patch() as mock_zoom:
             mock_zoom.GetRawdataShareSourceHelper = MagicMock(return_value=None)
-            self.share_source.play_bot_output_media_stream("screenshare")
+            self.share_source._begin_zoom_share()
 
         self.assertFalse(self.share_source._sharing_started)
 
@@ -142,8 +150,8 @@ class TestStoppingTheShare(WebpageStreamerShareSourceTestCase):
         ``nb::arg().none()``, so None is refused too. ``StopShare`` takes no arguments
         and is what the SDK documents for ending a share."""
         self.meeting_service.GetMeetingShareController.return_value.StopShare.return_value = SDKERR_SUCCESS
+        self.announce_the_share()
         with self.zoom_patch():
-            self.share_source.play_bot_output_media_stream("screenshare")
             self.share_source.stop_bot_output_media_stream()
 
         controller = self.meeting_service.GetMeetingShareController.return_value
@@ -167,8 +175,8 @@ class TestStoppingTheShare(WebpageStreamerShareSourceTestCase):
 
         Fails against the old behaviour, where the callback left _sharing_started set.
         """
+        self.announce_the_share()
         with self.zoom_patch():
-            self.share_source.play_bot_output_media_stream("screenshare")
             self.share_source.on_share_stop_send_callback()  # the meeting ended
             self.share_source.stop_bot_output_media_stream()
 
@@ -178,9 +186,9 @@ class TestStoppingTheShare(WebpageStreamerShareSourceTestCase):
     def test_wrong_usage_from_stop_share_is_not_reported_as_a_failure(self):
         """It means "there was no current sharing", which is the state being asked for."""
         controller = self.meeting_service.GetMeetingShareController.return_value
+        controller.StopShare.return_value = SDKERR_WRONG_USAGE
+        self.announce_the_share()
         with self.zoom_patch():
-            controller.StopShare.return_value = SDKERR_WRONG_USAGE
-            self.share_source.play_bot_output_media_stream("screenshare")
             with self.assertLogs("bots.zoom_bot_adapter.webpage_streamer_share_source", level="INFO") as logs:
                 self.share_source.stop_bot_output_media_stream()
 
@@ -234,8 +242,7 @@ class TestSayingWhenTheRoomSeesNothing(WebpageStreamerShareSourceTestCase):
         self.sender = FakeShareSender()
 
     def start_sharing(self):
-        with self.zoom_patch():
-            self.share_source.play_bot_output_media_stream("screenshare")
+        self.announce_the_share()
         self.share_source.on_share_start_send_callback(self.sender)
 
     def pump(self, times=1):
@@ -362,6 +369,160 @@ class TestSayingWhenTheRoomSeesNothing(WebpageStreamerShareSourceTestCase):
                 self.pump()
 
         self.assertTrue(any("The room is not seeing the shared page" in line for line in logs.output))
+
+
+class TestNotAnnouncingAShareWithNothingInIt(WebpageStreamerShareSourceTestCase):
+    """The share Zoom was told about before anything existed to fill it.
+
+    On 2026-08-09 a Zoom meeting watched a black rectangle for 65 seconds. The whole
+    path reported success: the streamer answered the offer, ICE completed, the bot
+    received a video track, the connection reached ``connected`` - and not one frame ever
+    crossed it. ``setExternalShareSource`` was called about 50ms after the SDP answer
+    came back, long before any frame could have arrived, so "Ada Sterling has started
+    screen sharing" was a claim about a picture nobody had checked existed.
+
+    Every test in this class fails against that behaviour, where
+    ``play_bot_output_media_stream`` registered the share immediately and unconditionally.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.clock = FakeClock()
+        self.restreams = []
+        self.share_source._request_restream = lambda: self.restreams.append(self.clock.now)
+
+    def clock_patch(self):
+        return patch("bots.zoom_bot_adapter.webpage_streamer_share_source.time", self.clock)
+
+    def logs(self, level="INFO"):
+        return self.assertLogs("bots.zoom_bot_adapter.webpage_streamer_share_source", level=level)
+
+    def ask_to_share(self):
+        with self.zoom_patch():
+            self.share_source.play_bot_output_media_stream("screenshare")
+
+    def wait_tick(self):
+        with self.zoom_patch():
+            return self.share_source._announce_the_share_once_frames_arrive()
+
+    def a_frame_arrives(self):
+        self.share_source.latest_frame.note_received()
+        self.share_source.latest_frame.put(b"i420", 1280, 720)
+
+    def test_no_share_is_registered_until_a_frame_has_arrived(self):
+        """The regression, and the whole point of the change."""
+        with self.clock_patch():
+            self.ask_to_share()
+            self.wait_tick()
+            self.clock.advance(10)
+            self.wait_tick()
+
+        self.assertEqual(self.helper.calls, [])
+        self.assertFalse(self.share_source._sharing_started)
+        self.assertTrue(self.share_source._share_requested)
+
+    def test_the_share_is_registered_as_soon_as_one_arrives(self):
+        with self.clock_patch():
+            self.ask_to_share()
+            self.wait_tick()
+            self.a_frame_arrives()
+            still_waiting = self.wait_tick()
+
+        self.assertEqual(len(self.helper.calls), 1)
+        self.assertTrue(self.share_source._sharing_started)
+        self.assertFalse(self.share_source._share_requested)
+        self.assertFalse(still_waiting)  # GLib: the timeout unschedules itself
+
+    def test_a_frame_that_arrived_before_the_ask_counts(self):
+        """The stream is opened before the share is asked for, so the first frame can
+        beat the request. Waiting for a *second* one would be waiting for nothing."""
+        self.a_frame_arrives()
+        with self.clock_patch():
+            self.ask_to_share()
+            self.wait_tick()
+
+        self.assertEqual(len(self.helper.calls), 1)
+
+    def test_a_stream_that_delivers_nothing_is_rebuilt_once(self):
+        with self.clock_patch():
+            self.ask_to_share()
+            self.clock.advance(16)  # SHARE_FIRST_FRAME_WAIT_SECONDS is 15
+            with self.logs(level="WARNING") as logs:
+                still_waiting = self.wait_tick()
+
+        self.assertEqual(len(self.restreams), 1)
+        self.assertTrue(still_waiting)  # it keeps looking, with the clock restarted
+        self.assertEqual(self.helper.calls, [])
+        self.assertTrue(any("Rebuilding the stream" in line for line in logs.output))
+
+    def test_a_rebuild_that_works_ends_in_a_share(self):
+        with self.clock_patch():
+            self.ask_to_share()
+            self.clock.advance(16)
+            self.wait_tick()  # asks for the rebuild
+            self.clock.advance(2)
+            self.a_frame_arrives()  # ...which produces a frame
+            self.wait_tick()
+
+        self.assertEqual(len(self.helper.calls), 1)
+        self.assertTrue(self.share_source._sharing_started)
+
+    def test_a_rebuild_is_only_asked_for_once(self):
+        with self.clock_patch():
+            self.ask_to_share()
+            for _ in range(3):
+                self.clock.advance(16)
+                self.wait_tick()
+
+        self.assertEqual(len(self.restreams), 1)
+
+    def test_a_stream_that_still_delivers_nothing_is_never_announced(self):
+        """The outcome that matters: the room is shown nothing, and the log says so at
+        ERROR. A black share for the length of a meeting is the failure being replaced."""
+        with self.clock_patch():
+            self.ask_to_share()
+            self.clock.advance(16)
+            self.wait_tick()  # the rebuild
+            self.clock.advance(16)
+            with self.logs(level="ERROR") as logs:
+                still_waiting = self.wait_tick()
+
+        self.assertEqual(self.helper.calls, [])
+        self.assertFalse(self.share_source._sharing_started)
+        self.assertFalse(self.share_source._share_requested)
+        self.assertFalse(still_waiting)
+        self.assertTrue(any("Not starting the Zoom share" in line for line in logs.output))
+        self.assertTrue(any("even after rebuilding the stream" in line for line in logs.output))
+
+    def test_a_share_source_with_nowhere_to_ask_gives_up_at_the_deadline(self):
+        """The callback is optional - the web adapters have no use for it - and without
+        one the deadline is simply the end of it."""
+        self.share_source._request_restream = None
+        with self.clock_patch():
+            self.ask_to_share()
+            self.clock.advance(16)
+            with self.logs(level="ERROR"):
+                self.wait_tick()
+
+        self.assertEqual(self.helper.calls, [])
+        self.assertFalse(self.share_source._share_requested)
+
+    def test_a_share_called_off_while_waiting_is_never_announced(self):
+        with self.clock_patch():
+            self.ask_to_share()
+            self.share_source.stop_bot_output_media_stream()
+            self.a_frame_arrives()
+            self.wait_tick()
+
+        self.assertEqual(self.helper.calls, [])
+        self.share_source._unschedule.assert_called()
+
+    def test_only_one_wait_is_scheduled_however_often_the_share_is_asked_for(self):
+        with self.clock_patch():
+            self.ask_to_share()
+            self.ask_to_share()
+
+        self.assertEqual(self.share_source._schedule.call_count, 1)
 
 
 class TestCountingFrames(WebpageStreamerShareSourceTestCase):

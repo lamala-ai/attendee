@@ -456,3 +456,85 @@ class TestWebpageStreamerManagerKeepalive(TestCase):
 
         # Should have tried twice
         self.assertEqual(mock_post.call_count, times_to_try)
+
+
+class TestWebpageStreamerManagerRestartStream(TestCase):
+    """Rebuilding a stream that negotiated fine and then delivered nothing.
+
+    The share source is what can tell - it is holding the frame counters - but it cannot
+    do anything about it on its own: the offer, the answer and the streamer's own
+    endpoints are all here. Renegotiating alone would not be enough either, because the
+    streamer hands every connection the same capture pipeline and only builds a new one
+    when it is holding none, which is why /restart_capture comes first.
+    """
+
+    def _create_manager(self):
+        return WebpageStreamerManager(
+            is_bot_ready_for_webpage_streamer_callback=MagicMock(),
+            get_peer_connection_offer_callback=MagicMock(),
+            start_peer_connection_callback=MagicMock(),
+            play_bot_output_media_stream_callback=MagicMock(),
+            stop_bot_output_media_stream_callback=MagicMock(),
+            on_message_that_webpage_streamer_connection_can_start_callback=MagicMock(),
+            webpage_streamer_service_hostname="test-hostname",
+        )
+
+    @patch("bots.bot_controller.webpage_streamer_manager.requests.post")
+    def test_the_capture_is_rebuilt_before_the_connection_is_made_again(self, mock_post):
+        manager = self._create_manager()
+        manager.last_non_empty_url = "http://example.com/page"
+        manager.webrtc_connection_started = True
+        manager.get_peer_connection_offer_callback.return_value = {"sdp": "offer-sdp", "type": "offer"}
+
+        responses = []
+        for body in ({}, {"sdp": "answer-sdp", "type": "answer"}, {}):
+            response = MagicMock()
+            response.status_code = 200
+            response.json.return_value = body
+            responses.append(response)
+        mock_post.side_effect = responses
+
+        manager._restart_stream()
+
+        paths = [call.args[0] for call in mock_post.call_args_list]
+        self.assertEqual([path.rsplit("/", 1)[-1] for path in paths], ["restart_capture", "offer", "start_streaming"])
+        manager.start_peer_connection_callback.assert_called_once_with({"sdp": "answer-sdp", "type": "answer"})
+        self.assertTrue(manager.webrtc_connection_started)
+
+    @patch("bots.bot_controller.webpage_streamer_manager.requests.post")
+    def test_a_streamer_that_cannot_be_asked_is_still_offered_to(self, mock_post):
+        """A streamer too old to know the endpoint answers 404, and a rebuilt connection
+        is still the best thing left to try."""
+        manager = self._create_manager()
+        manager.last_non_empty_url = "http://example.com/page"
+        manager.get_peer_connection_offer_callback.return_value = {"sdp": "offer-sdp", "type": "offer"}
+
+        offer_response = MagicMock()
+        offer_response.status_code = 200
+        offer_response.json.return_value = {"sdp": "answer-sdp", "type": "answer"}
+        start_response = MagicMock()
+        start_response.status_code = 200
+        mock_post.side_effect = [Exception("Connection refused"), offer_response, start_response]
+
+        manager._restart_stream()
+
+        self.assertEqual(mock_post.call_count, 3)
+        self.assertTrue(manager.webrtc_connection_started)
+
+    @patch("bots.bot_controller.webpage_streamer_manager.threading.Thread")
+    def test_there_is_nothing_to_rebuild_before_a_page_has_been_asked_for(self, mock_thread):
+        manager = self._create_manager()
+
+        manager.restart_stream()
+
+        mock_thread.assert_not_called()
+
+    @patch("bots.bot_controller.webpage_streamer_manager.threading.Thread")
+    def test_a_bot_on_its_way_out_does_not_rebuild_anything(self, mock_thread):
+        manager = self._create_manager()
+        manager.last_non_empty_url = "http://example.com/page"
+        manager.cleaned_up = True
+
+        manager.restart_stream()
+
+        mock_thread.assert_not_called()

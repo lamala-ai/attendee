@@ -55,6 +55,16 @@ class BotAdapter:
 
     DEBUG_RECORDING_FILE_PATH = "/tmp/debug_screen_recording.mp4"
 
+    def set_webpage_streamer_restart_callback(self, callback):
+        """How this adapter can ask for the webpage stream to be built again.
+
+        A no-op by default: an adapter whose bot is a browser owns the peer connection
+        inside the page and has nothing here to hand the callback to. Only the zoom
+        native adapter receives the video track in Python, and so is the only one that
+        can tell that no frame is arriving.
+        """
+        pass
+
     def set_presence_indicator(self, state):
         """Say what the bot is doing on its own tile - see bots/presence_indicator.py.
 

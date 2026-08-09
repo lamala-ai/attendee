@@ -161,6 +161,12 @@ class WebpageStreamer:
     KEEPALIVE_CHECK_INTERVAL_SECONDS = 60
     KEEPALIVE_TIMEOUT_SECONDS = 900
 
+    # How long a capture pipeline that has reached PLAYING gets to hand over one frame
+    # before it is treated as dead. Generous next to the 66ms between frames at 15fps,
+    # and short enough to spend twice inside a single /offer without the bot's own 30s
+    # timeout on that request running out.
+    CAPTURE_FIRST_FRAME_SECONDS = 5
+
     UPSTREAM_AUDIO_TRACK_KEY = "upstream_audio_track"
 
     def __init__(
@@ -191,6 +197,12 @@ class WebpageStreamer:
         self._gst_audio_sink = None
         self._video_track = None
         self._audio_track = None
+        # Whether capturing audio is worth attempting at all in this container. It is
+        # decided by the first attempt and remembered: a box with no sound card has none
+        # on the next pipeline either, and rebuilding the doomed half every time costs a
+        # second of every share and writes a WARNING that reads like the reason a share
+        # failed. Off from the start when the deployment already knows.
+        self._audio_capture_worth_trying = os.getenv("WEBPAGE_STREAMER_CAPTURE_AUDIO", "").strip().lower() not in ("0", "false", "no")
 
     def _video_branch(self, width, height, display_var):
         return f"""
@@ -260,14 +272,23 @@ class WebpageStreamer:
         video = self._video_branch(width, height, display_var)
 
         logger.info("Starting GStreamer capture pipeline")
-        pipeline, video_sink, audio_sink, reason = self._try_pipeline(video + self.AUDIO_BRANCH, True)
+        pipeline = video_sink = audio_sink = None
+        reason = "audio capture is turned off"
+
+        if self._audio_capture_worth_trying:
+            pipeline, video_sink, audio_sink, reason = self._try_pipeline(video + self.AUDIO_BRANCH, True)
+            if pipeline is None:
+                # The audio branch is the fragile half - alsasrc needs a sound card, and a
+                # container often has none. Losing it costs nothing here: what is being
+                # shared is a web page, and the screenshare track carries no audio anyway.
+                # Losing the video is the whole feature, so it is worth going on without.
+                self._audio_capture_worth_trying = False
+                logger.warning(f"GStreamer pipeline with audio would not start ({reason}) - capturing video only from here on, and not trying audio again in this process")
 
         if pipeline is None:
-            # The audio branch is the fragile half - alsasrc needs a sound card, and a
-            # container often has none. Losing it costs nothing here: what is being
-            # shared is a web page, and the screenshare track carries no audio anyway.
-            # Losing the video is the whole feature, so it is worth going on without.
-            logger.warning(f"GStreamer pipeline with audio would not start ({reason}) - capturing video only")
+            # Not a fallback so much as the other supported shape: a page rendered for a
+            # screenshare has no audio to carry, and this is the pipeline that runs on
+            # every container without a sound card.
             pipeline, video_sink, audio_sink, reason = self._try_pipeline(video, False)
 
         if pipeline is None:
@@ -285,6 +306,78 @@ class WebpageStreamer:
             framerate=15,
         )
         self._audio_track = GstAudioStreamTrack(sink=self._gst_audio_sink, sample_rate=16000, channels=1) if self._gst_audio_sink else None
+
+    @staticmethod
+    def _pull_one_sample(sink, seconds):
+        return sink.try_pull_sample(int(seconds * Gst.SECOND))
+
+    def _report_bus_messages(self):
+        """Say whatever the pipeline has been saying since it started playing.
+
+        The bus is otherwise only ever read when a state change fails, so an element that
+        gives up *after* PLAYING - a source that loses its display, a caps negotiation
+        that only fails once the first buffer is pushed - says so into a queue nobody
+        empties. That is the shape of the 2026-08-09 failure: a pipeline reported PLAYING,
+        produced nothing for 65 seconds, and logged not one line about it.
+        """
+        if self._gst_pipeline is None:
+            return
+        bus = self._gst_pipeline.get_bus()
+        while True:
+            message = bus.timed_pop_filtered(0, Gst.MessageType.ERROR | Gst.MessageType.WARNING | Gst.MessageType.EOS)
+            if message is None:
+                return
+            if message.type == Gst.MessageType.EOS:
+                logger.error("The GStreamer capture pipeline reached end of stream - it will not produce another frame")
+                continue
+            error, debug = message.parse_error() if message.type == Gst.MessageType.ERROR else message.parse_warning()
+            logger.error(f"The GStreamer capture pipeline reported {'an error' if message.type == Gst.MessageType.ERROR else 'a warning'} after it started playing: {error.message} [{debug}]")
+
+    async def _capture_is_producing_frames(self):
+        """Has the pipeline that says it is PLAYING actually handed over a frame?
+
+        Asked before an offer is answered, because everything downstream of here reports
+        success whether or not it has: the SDP is exchanged, ICE completes, the bot
+        receives a track, and the room watches a black rectangle. One frame off the
+        appsink is the cheapest proof that what is being offered exists.
+        """
+        sink = self._gst_video_sink
+        if sink is None:
+            logger.error("The capture pipeline has no video sink, so there is nothing to offer")
+            return False
+
+        loop = asyncio.get_running_loop()
+        sample = await loop.run_in_executor(None, self._pull_one_sample, sink, self.CAPTURE_FIRST_FRAME_SECONDS)
+        self._report_bus_messages()
+        if sample is None:
+            logger.error(f"The capture pipeline reached PLAYING but produced no frame in {self.CAPTURE_FIRST_FRAME_SECONDS}s. Anything streamed from it now would be a share of nothing.")
+            return False
+        return True
+
+    async def _capture_ready_for_a_new_connection(self):
+        """A capture that is proven to produce, rebuilt once if it is not.
+
+        The rebuild is the whole session - browser, pipeline and any peer connections
+        left over - because the browser is the other half of what ``ximagesrc`` is
+        pointed at and there is no way from here to tell which of the two went quiet.
+
+        Taking the other connections down with it sounds worse than it is, and only in
+        the shared deployment: every connection this process is serving is fed by the one
+        pipeline that has just been shown not to produce, so they are all already
+        carrying nothing. Rebuilding is the only thing that gets any of them a picture.
+        """
+        await self._ensure_browser()
+        if self._gst_pipeline is None:
+            self._start_gstreamer_capture()
+
+        if await self._capture_is_producing_frames():
+            return True
+
+        logger.warning("Rebuilding the browser and the capture pipeline before answering this offer")
+        await self.release_streaming_session()
+        await self._ensure_browser()
+        self._start_gstreamer_capture()
+        return await self._capture_is_producing_frames()
 
     def _stop_gstreamer_capture(self):
         if self._gst_pipeline:
@@ -529,12 +622,11 @@ class WebpageStreamer:
 
             # There is a browser to capture whenever this process was started, and there is
             # not when a shared streamer released an idle session - the pipeline would
-            # capture an empty display and the room would get a blank share.
-            await self._ensure_browser()
-
-            # Lazy-start capture so we don't accumulate latency before WebRTC is up
-            if self._gst_pipeline is None:
-                self._start_gstreamer_capture()
+            # capture an empty display and the room would get a blank share. Lazy-started
+            # so we don't accumulate latency before WebRTC is up, and proven before it is
+            # offered, because a connection is the one thing here that succeeds either way.
+            if not await self._capture_ready_for_a_new_connection():
+                return web.json_response({"error": "The capture pipeline is not producing frames, so there is nothing to stream"}, status=503)
 
             pc = RTCPeerConnection()
             pcs.add(pc)
@@ -577,6 +669,27 @@ class WebpageStreamer:
             await self._ensure_browser()
             self.driver.get(webpage_url)
 
+            return web.json_response({"status": "success"})
+
+        async def restart_capture(req):
+            """Give back the whole streaming session so the next offer builds a new one.
+
+            For the bot that can see what nobody here can: that the frames it negotiated
+            are not arriving. The streamer hands every connection the same pipeline and
+            only builds another when it is holding none, so without this a renegotiation
+            would be handed the very pipeline that stopped producing.
+            """
+            self._report_bus_messages()
+            # Checked rather than taken on trust, because in the shared deployment this
+            # renderer is several meetings' at once: one bot whose own connection went
+            # wrong must not be able to take the pipeline out from under the others. A
+            # pipeline that is still producing is not the thing that is broken.
+            if await self._capture_is_producing_frames():
+                logger.info("Not rebuilding the streaming session: the capture pipeline is still producing frames")
+                return web.json_response({"status": "not needed"})
+
+            logger.info("Rebuilding the streaming session on request")
+            await self.release_streaming_session()
             return web.json_response({"status": "success"})
 
         async def keepalive(req):
@@ -643,6 +756,9 @@ class WebpageStreamer:
         app.middlewares.append(add_cors_headers)
 
         app.router.add_post("/start_streaming", start_streaming)
+
+        app.router.add_post("/restart_capture", restart_capture)
+        app.router.add_options("/restart_capture", handle_cors_preflight)
 
         app.router.add_post("/keepalive", keepalive)
         app.router.add_options("/keepalive", handle_cors_preflight)
