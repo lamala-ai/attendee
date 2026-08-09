@@ -178,16 +178,15 @@ class TestStoppingTheShare(WebpageStreamerShareSourceTestCase):
     def test_wrong_usage_from_stop_share_is_not_reported_as_a_failure(self):
         """It means "there was no current sharing", which is the state being asked for."""
         controller = self.meeting_service.GetMeetingShareController.return_value
-        with self.zoom_patch() as mock_zoom:
+        with self.zoom_patch():
             controller.StopShare.return_value = SDKERR_WRONG_USAGE
             self.share_source.play_bot_output_media_stream("screenshare")
-            with self.assertLogs(
-                "bots.zoom_bot_adapter.webpage_streamer_share_source", level="INFO"
-            ) as logs:
+            with self.assertLogs("bots.zoom_bot_adapter.webpage_streamer_share_source", level="INFO") as logs:
                 self.share_source.stop_bot_output_media_stream()
 
         self.assertTrue(any("no share left to stop" in line for line in logs.output))
         self.assertFalse(self.share_source._sharing_started)
+
 
 class FakeShareSender:
     """The object Zoom hands to onStartSend. Records what it was asked to send."""
