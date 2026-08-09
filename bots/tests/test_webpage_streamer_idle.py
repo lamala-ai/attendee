@@ -55,6 +55,14 @@ class FakeDriver:
         self.quit_count += 1
 
 
+class FakeBus:
+    """A bus with nothing on it. Real ones carry the errors an element posts after it
+    started playing, which is exactly what nobody used to read."""
+
+    def timed_pop_filtered(self, timeout, message_types):
+        return None
+
+
 class FakePipeline:
     """Enough of a Gst.Pipeline to say which state it was last put into."""
 
@@ -64,6 +72,25 @@ class FakePipeline:
     def set_state(self, state):
         self.states.append(state)
         return Gst.StateChangeReturn.SUCCESS
+
+    def get_bus(self):
+        return FakeBus()
+
+
+class FakeVideoSink:
+    """An appsink that either has a frame to hand over, or never will.
+
+    The second kind is the 2026-08-09 failure in one object: a pipeline that reached
+    PLAYING, was offered to a bot, and produced nothing for the length of a meeting.
+    """
+
+    def __init__(self, produces=True):
+        self.produces = produces
+        self.pulls = []
+
+    def try_pull_sample(self, timeout_ns):
+        self.pulls.append(timeout_ns)
+        return object() if self.produces else None
 
 
 class FakePeerConnection:
@@ -113,7 +140,7 @@ class WebpageStreamerIdleTestCase(SimpleTestCase):
             # A streamer mid-meeting: a browser, a capture pipeline and a peer connection.
             streamer.driver = FakeDriver()
             streamer._gst_pipeline = FakePipeline()
-            streamer._gst_video_sink = MagicMock()
+            streamer._gst_video_sink = FakeVideoSink()
             streamer._video_track = MagicMock()
             streamer._peer_connections.add(FakePeerConnection())
         return streamer
@@ -262,6 +289,7 @@ class TestRenderingAgainAfterARelease(WebpageStreamerIdleTestCase):
 
         def restart_capture():
             streamer._gst_pipeline = rebuilt
+            streamer._gst_video_sink = FakeVideoSink()
             streamer._video_track = "video-track"
 
         with self.browser_patch([next_driver]), patch("bots.webpage_streamer.webpage_streamer.RTCPeerConnection", return_value=peer_connection), patch.object(streamer, "_start_gstreamer_capture", side_effect=restart_capture):
@@ -280,6 +308,108 @@ class TestRenderingAgainAfterARelease(WebpageStreamerIdleTestCase):
                 self.assertIn(peer_connection, streamer._peer_connections)
             finally:
                 await client.close()
+
+    async def test_an_offer_is_refused_when_the_capture_produces_no_frames(self):
+        """The 2026-08-09 regression, from the renderer's side.
+
+        A pipeline that says PLAYING and then produces nothing used to be offered exactly
+        like a working one: the SDP was exchanged, ICE completed, the bot received a
+        track, and the room watched a black screen for 65 seconds. Nothing on this side
+        could fail, because nothing on this side ever looked.
+
+        Both attempts are made here - the offer rebuilds once before giving up - and both
+        find a dead sink, so the offer is refused instead of answered.
+        """
+        streamer = self.streamer(shared=True)
+        self.stop_the_clock(streamer)
+        streamer._gst_video_sink = FakeVideoSink(produces=False)
+        peer_connection = FakePeerConnection()
+
+        def rebuild_just_as_dead():
+            streamer._gst_pipeline = FakePipeline()
+            streamer._gst_video_sink = FakeVideoSink(produces=False)
+            streamer._video_track = "video-track"
+
+        with self.browser_patch([FakeDriver()]), patch("bots.webpage_streamer.webpage_streamer.RTCPeerConnection", return_value=peer_connection), patch.object(streamer, "_start_gstreamer_capture", side_effect=rebuild_just_as_dead):
+            client = TestClient(TestServer(streamer.build_web_app()))
+            await client.start_server()
+            try:
+                response = await client.post("/offer", json={"sdp": "offer-sdp", "type": "offer"})
+
+                self.assertEqual(response.status, 503)
+                self.assertIn("not producing frames", (await response.json())["error"])
+                self.assertEqual(peer_connection.tracks, [])  # nothing was ever offered
+                self.assertEqual(streamer._peer_connections, set())
+            finally:
+                await client.close()
+
+    async def test_an_offer_rebuilds_a_capture_that_stopped_producing_and_then_answers(self):
+        """The recovery. One rebuild is enough when the renderer is what went quiet."""
+        streamer = self.streamer(shared=True)
+        self.stop_the_clock(streamer)
+        streamer._gst_video_sink = FakeVideoSink(produces=False)
+        released_driver, peer_connection = streamer.driver, FakePeerConnection()
+
+        def rebuild_a_working_one():
+            streamer._gst_pipeline = FakePipeline()
+            streamer._gst_video_sink = FakeVideoSink(produces=True)
+            streamer._video_track = "video-track"
+
+        with self.browser_patch([FakeDriver()]), patch("bots.webpage_streamer.webpage_streamer.RTCPeerConnection", return_value=peer_connection), patch.object(streamer, "_start_gstreamer_capture", side_effect=rebuild_a_working_one):
+            client = TestClient(TestServer(streamer.build_web_app()))
+            await client.start_server()
+            try:
+                response = await client.post("/offer", json={"sdp": "offer-sdp", "type": "offer"})
+
+                self.assertEqual(response.status, 200)
+                self.assertEqual(peer_connection.tracks, ["video-track"])
+                # The browser is half of what the pipeline is pointed at, so the rebuild
+                # is the whole session rather than the pipeline alone.
+                self.assertEqual(released_driver.quit_count, 1)
+            finally:
+                await client.close()
+
+    async def test_restart_capture_gives_the_session_back(self):
+        streamer = self.streamer(shared=True)
+        self.stop_the_clock(streamer)
+        streamer._gst_video_sink = FakeVideoSink(produces=False)
+        driver, pipeline = streamer.driver, streamer._gst_pipeline
+        peer_connection = next(iter(streamer._peer_connections))
+
+        client = TestClient(TestServer(streamer.build_web_app()))
+        await client.start_server()
+        try:
+            response = await client.post("/restart_capture", json={})
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual((await response.json())["status"], "success")
+            self.assertIsNone(streamer.driver)
+            self.assertEqual(driver.quit_count, 1)
+            self.assertEqual(pipeline.states, [Gst.State.NULL])
+            self.assertTrue(peer_connection.closed)
+        finally:
+            await client.close()
+
+    async def test_restart_capture_leaves_a_working_capture_alone(self):
+        """One bot's connection going wrong must not take the renderer away from the
+        other meetings sharing it - the whole reason the shared streamer stopped exiting
+        when it went idle."""
+        streamer = self.streamer(shared=True)
+        self.stop_the_clock(streamer)
+        driver, pipeline = streamer.driver, streamer._gst_pipeline
+
+        client = TestClient(TestServer(streamer.build_web_app()))
+        await client.start_server()
+        try:
+            response = await client.post("/restart_capture", json={})
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual((await response.json())["status"], "not needed")
+            self.assertIs(streamer.driver, driver)
+            self.assertEqual(driver.quit_count, 0)
+            self.assertEqual(pipeline.states, [])
+        finally:
+            await client.close()
 
     async def test_only_one_browser_is_started_when_requests_arrive_together(self):
         """Two handlers racing on an empty streamer would otherwise start two Chromes and

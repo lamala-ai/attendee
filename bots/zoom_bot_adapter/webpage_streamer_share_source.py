@@ -22,6 +22,14 @@ the aiortc thread*: the receiver only ever parks the newest frame, and a GLib ti
 on the adapter's own thread picks it up and sends it. That also gives us the right
 dropping behaviour for free - a screenshare wants the current frame, never a backlog of
 stale ones, so a one-slot buffer is more correct than a queue.
+
+**Nothing is said to the room until a frame has arrived.** The share is asked for long
+before there is anything to fill it, and a WebRTC connection succeeds whether or not
+media ever crosses it, so "Ada Sterling has started screen sharing" used to be announced
+about 50ms after the SDP answer - the room's only signal that a share exists, spent on a
+stream that had not yet delivered, and on 2026-08-09 never would. So the share is armed
+here and announced by a timeout that waits for a real frame, and a stream that produces
+none is rebuilt once and then abandoned in words rather than in black.
 """
 
 from __future__ import annotations
@@ -50,6 +58,18 @@ SHARE_FRAME_INTERVAL_MS = 33
 # 8s - so this is never the ordinary first second of a share, and short enough that it
 # lands while the meeting it is ruining is still happening.
 SHARE_FIRST_FRAME_DEADLINE_SECONDS = 15
+
+# How long to wait for that first frame *before* telling Zoom there is a share at all,
+# and how often to look while waiting. Same budget as above and for the same reason: a
+# share is entitled to a cold browser start, and nothing longer than that is waiting for
+# anything.
+SHARE_FIRST_FRAME_WAIT_SECONDS = SHARE_FIRST_FRAME_DEADLINE_SECONDS
+SHARE_FRAME_WAIT_INTERVAL_MS = 100
+
+# How many frames must have made it all the way to I420 before the share is announced.
+# One is the honest minimum: it is the difference between "the page is on its way" and
+# "there is something to put on the screen", and it is what "Ada is sharing" claims.
+SHARE_FRAMES_BEFORE_ANNOUNCING = 1
 
 # Frames between "still alive" lines. At SHARE_FRAME_INTERVAL_MS that is about once a
 # minute: enough to tell a live share from a stopped one in a log after the fact, not
@@ -119,12 +139,17 @@ class WebpageStreamerShareSource:
     hooks the bot controller calls; everything else here is private.
     """
 
-    def __init__(self, meeting_service, schedule_on_main_thread, unschedule_on_main_thread):
+    def __init__(self, meeting_service, schedule_on_main_thread, unschedule_on_main_thread, request_restream=None):
         self.meeting_service = meeting_service
         # GLib.timeout_add / GLib.source_remove, injected so this module never imports gi
         # and can be exercised without a main loop.
         self._schedule = schedule_on_main_thread
         self._unschedule = unschedule_on_main_thread
+        # How to ask for the whole stream to be built again - the streamer's capture
+        # session and this peer connection with it. Optional, because it is the one thing
+        # here that reaches outside the bot, and a share source without it simply gives up
+        # instead of retrying.
+        self._request_restream = request_restream
 
         self.latest_frame = LatestFrame()
 
@@ -132,6 +157,7 @@ class WebpageStreamerShareSource:
         self._loop = None
         self._loop_thread = None
         self._peer_connection = None
+        self._video_track = None
 
         # --- the Zoom side, all touched only from the adapter's GLib thread ---
         self.share_source_helper = None
@@ -146,6 +172,12 @@ class WebpageStreamerShareSource:
         self._frames_sent = 0
         self._sharing_since = None
         self._warned_about_no_frames = False
+        # The share that has been asked for but not yet announced, because no frame has
+        # arrived to fill it. See _announce_the_share_once_frames_arrive.
+        self._share_requested = False
+        self._waiting_since = None
+        self._wait_timeout_id = None
+        self._restream_attempted = False
 
     # --- lifecycle -----------------------------------------------------
 
@@ -193,12 +225,22 @@ class WebpageStreamerShareSource:
     async def _create_offer(self):
         from aiortc import RTCPeerConnection
 
+        # A second offer means the first stream is being replaced, so the connection it
+        # was carried on is closed rather than left running: two receivers writing into
+        # one frame slot would make "the room is seeing nothing" unanswerable.
+        if self._peer_connection is not None:
+            try:
+                await self._peer_connection.close()
+            except Exception:
+                logger.info("The previous webpage streamer peer connection did not close cleanly")
+
         self._peer_connection = RTCPeerConnection()
 
         @self._peer_connection.on("track")
         def on_track(track):
             logger.info(f"Webpage streamer track received: {track.kind}")
             if track.kind == "video":
+                self._video_track = track
                 asyncio.ensure_future(self._consume_video(track))
 
         @self._peer_connection.on("connectionstatechange")
@@ -243,7 +285,11 @@ class WebpageStreamerShareSource:
                 frame = await track.recv()
             except Exception:
                 logger.info("Webpage streamer video track ended")
-                self.latest_frame.clear()
+                # Only if it is still the current one: a renegotiation leaves the old
+                # track ending after the new one has started delivering, and clearing
+                # then would throw away the frame that proves the recovery worked.
+                if self._video_track is track:
+                    self.latest_frame.clear()
                 return
             if self.latest_frame.note_received() == 1:
                 logger.info(f"First video frame received from the webpage streamer: {frame.width}x{frame.height}")
@@ -261,6 +307,11 @@ class WebpageStreamerShareSource:
         The web adapter can also route this stream to the bot's webcam; here the webcam
         is already the virtual camera the adapter owns, so anything else is ignored
         rather than quietly stealing that source.
+
+        Nothing is said to Zoom yet. The share is *armed*, and it is announced by
+        ``_announce_the_share_once_frames_arrive`` when a frame has actually made it off
+        the WebRTC track and into I420 - because "Ada Sterling has started screen sharing"
+        is a claim about a picture, and Zoom will happily make it about an empty one.
         """
         if output_destination != "screenshare":
             logger.info(f"Ignoring webpage streamer output destination {output_destination} on the zoom native adapter")
@@ -268,6 +319,77 @@ class WebpageStreamerShareSource:
         if self._sharing_started:
             logger.info("Webpage streamer share already started")
             return
+        if self._share_requested:
+            logger.info("Webpage streamer share already waiting for its first frame")
+            return
+
+        self._share_requested = True
+        self._waiting_since = time.monotonic()
+        self._restream_attempted = False
+        received, converted = self.latest_frame.counts()
+        logger.info(f"Waiting for the first frame from the webpage streamer before starting the Zoom share ({received} received, {converted} converted so far)")
+        if self._wait_timeout_id is None:
+            self._wait_timeout_id = self._schedule(SHARE_FRAME_WAIT_INTERVAL_MS, self._announce_the_share_once_frames_arrive)
+
+    def _announce_the_share_once_frames_arrive(self):
+        """Announce the armed share when there is something to fill it, or act.
+
+        This is the whole of the 2026-08-09 fix. Zoom used to be told about the share
+        roughly 50ms after the SDP answer came back, which is before any frame could
+        exist, so a stream that never delivered one was indistinguishable - to the room -
+        from one that did: 65 seconds of "Ada Sterling has started screen sharing" over a
+        black rectangle.
+
+        Runs on the adapter's GLib thread. Returns True to stay scheduled, False to stop,
+        which is GLib's contract for a repeating timeout.
+        """
+        if not self._share_requested:
+            self._wait_timeout_id = None
+            return False
+
+        _received, converted = self.latest_frame.counts()
+        if converted >= SHARE_FRAMES_BEFORE_ANNOUNCING:
+            self._wait_timeout_id = None
+            self._begin_zoom_share()
+            return False
+
+        if time.monotonic() - self._waiting_since < SHARE_FIRST_FRAME_WAIT_SECONDS:
+            return True
+
+        return self._act_on_a_stream_that_is_not_delivering()
+
+    def _act_on_a_stream_that_is_not_delivering(self):
+        """One bounded rebuild, then give up in words rather than in black.
+
+        The rebuild is the only recovery worth trying from here: everything on this side
+        reported success - the offer was answered, the track arrived, the connection
+        reached ``connected`` - so what is broken is upstream of the track, in the
+        renderer that a rebuild replaces. If that does not work either, the room is left
+        seeing nothing, which is the honest outcome and the one somebody notices.
+        """
+        received, converted = self.latest_frame.counts()
+        if not self._restream_attempted and self._request_restream is not None:
+            self._restream_attempted = True
+            self._waiting_since = time.monotonic()
+            logger.warning(f"No frame has arrived from the webpage streamer in {SHARE_FIRST_FRAME_WAIT_SECONDS}s ({received} received, {converted} converted). Rebuilding the stream before starting the share.")
+            try:
+                self._request_restream()
+            except Exception:
+                logger.exception("Could not ask for the webpage stream to be rebuilt")
+            return True
+
+        self._share_requested = False
+        self._waiting_since = None
+        self._wait_timeout_id = None
+        logger.error(f"Not starting the Zoom share: no frame has arrived from the webpage streamer ({received} received, {converted} converted){' even after rebuilding the stream' if self._restream_attempted else ''}. The room is shown nothing rather than a share of nothing.")
+        return False
+
+    def _begin_zoom_share(self):
+        """Register the share source with Zoom. Only reached with a frame in hand."""
+        # The waiting is over either way: this either becomes a share or a refusal, and
+        # neither is something to keep looking for a first frame about.
+        self._share_requested = False
+        self._waiting_since = None
 
         self.share_source_helper = zoom.GetRawdataShareSourceHelper()
         if not self.share_source_helper:
@@ -379,11 +501,12 @@ class WebpageStreamerShareSource:
     def _warn_if_the_room_is_seeing_nothing(self) -> None:
         """Report, once, a share Zoom accepted that is not showing anything.
 
-        This is the gap that let a live meeting watch a black screen for its whole
-        length while every line in the log said success. setExternalShareSource returned
-        SDKERR_SUCCESS, onStartSend fired, the pump was scheduled - and then found an
-        empty slot thirty times a second and returned quietly, which reads exactly like a
-        healthy share. Roughly 2,300 of those ticks produced no output at all.
+        A share is no longer announced before a frame exists, so this is now about a
+        stream that *stops*: the renderer going quiet mid-meeting looks, from here,
+        exactly like the pump finding an empty slot thirty times a second and returning
+        quietly. It is the same silence that let a live meeting watch a black screen for
+        its whole length while every line in the log said success - roughly 2,300 ticks
+        that produced no output at all.
 
         The counts are in the message because they say which half is at fault, and the
         three of them cannot be recovered afterwards from anything else that is logged.
@@ -401,10 +524,21 @@ class WebpageStreamerShareSource:
             self._unschedule(self._pump_timeout_id)
             self._pump_timeout_id = None
 
+    def _stop_waiting_to_share(self):
+        self._share_requested = False
+        self._waiting_since = None
+        if self._wait_timeout_id is not None:
+            self._unschedule(self._wait_timeout_id)
+            self._wait_timeout_id = None
+
     # --- hook 4: take it down ------------------------------------------
 
     def stop_bot_output_media_stream(self, output_destination=None):
         self._stop_pump()
+        # A share that is called off before it was ever announced still has a timeout
+        # looking for its first frame, and that timeout would otherwise start a share
+        # nobody asked for any more.
+        self._stop_waiting_to_share()
         self.latest_frame.clear()
         self._sharing_since = None
         if self._sharing_started and self.meeting_service:

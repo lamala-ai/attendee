@@ -136,6 +136,38 @@ class WebpageStreamerManager:
 
         self.webrtc_connection_started = True
 
+    def restart_stream(self):
+        """Build the whole stream again: the streamer's capture session, then this
+        connection to it.
+
+        Asked for by the thing that can tell it is broken - on the zoom native adapter,
+        the share source, which knows that no frame has arrived. Renegotiating alone
+        would not be enough: the streamer hands every peer connection the *same* capture
+        pipeline and only builds a new one when it is holding none, so a pipeline that
+        has stopped producing would be handed straight back. ``/restart_capture`` is what
+        makes the next offer build a fresh one.
+
+        Returns immediately and does the work on its own thread: the caller is a GLib
+        timeout on the adapter's thread, and the SDK's main loop must not wait through an
+        SDP round trip and a browser start.
+        """
+        if self.cleaned_up or not self.last_non_empty_url:
+            return
+        threading.Thread(target=self._restart_stream, name="webpage-streamer-restart", daemon=True).start()
+
+    def _restart_stream(self):
+        url = self.last_non_empty_url
+        try:
+            response = requests.post(f"http://{self.streaming_service_hostname()}:8000/restart_capture", json={}, timeout=30)
+            logger.info(f"Webpage streamer restart_capture response: {response.status_code}")
+        except Exception as e:
+            # Worth going on regardless: a streamer too old to know this endpoint answers
+            # 404, and the offer below is still the best thing left to try.
+            logger.warning(f"Could not ask the webpage streamer to rebuild its capture: {e}")
+
+        self.webrtc_connection_started = False
+        self.start_or_update_webrtc_connection(url)
+
     def send_webpage_streamer_keepalive_periodically(self):
         """Send keepalive requests to the streaming service periodically."""
         while not self.cleaned_up:

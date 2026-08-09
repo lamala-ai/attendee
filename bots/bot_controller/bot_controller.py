@@ -960,6 +960,9 @@ class BotController:
                 on_message_that_webpage_streamer_connection_can_start_callback=self.on_message_that_webpage_streamer_connection_can_start,
                 webpage_streamer_service_hostname=self.bot_in_db.k8s_webpage_streamer_service_hostname(),
             )
+            # The one hook that points back at the manager: an adapter that can see the
+            # stream is not delivering needs a way to say so.
+            self.adapter.set_webpage_streamer_restart_callback(self.webpage_streamer_manager.restart_stream)
             self.webpage_streamer_manager.init()
 
         self.bot_resource_snapshot_taker = BotResourceSnapshotTaker(self.bot_in_db)
