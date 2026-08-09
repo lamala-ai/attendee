@@ -39,25 +39,68 @@ def streamer_is_shared():
     return os.getenv("WEBPAGE_STREAMER_IS_SHARED", "").strip().lower() in ("1", "true", "yes")
 
 
+# How long a capture that has reached PLAYING may hand over nothing before that is worth
+# acting on. Generous next to the 66ms between frames at 15fps, and short enough to spend
+# twice inside one /offer without the bot's own 30s timeout on that request running out.
+CAPTURE_FRAME_DEADLINE_SECONDS = 5
+
+
 class GstVideoStreamTrack(MediaStreamTrack):
     kind = "video"
 
-    def __init__(self, sink, width, height, framerate=15):
+    def __init__(self, sink, width, height, framerate=15, fault=None, stall_deadline=CAPTURE_FRAME_DEADLINE_SECONDS):
         super().__init__()
         self._sink = sink
         self._width = width
         self._height = height
         self._framerate = framerate
         self._base_pts_ns = None
+        # Asked, never read directly. The pipeline's bus is a *destructive* queue, so
+        # this track does not pop from it: `fault` is the streamer's single reader, which
+        # drains the bus into the log and remembers anything fatal. Two readers would not
+        # split the messages between them - whichever got there first would take the
+        # error, and the other would find a clean bus and conclude all was well.
+        self._fault = fault
+        self._stall_deadline = stall_deadline
+        self._frames = 0
+        self._stalled = False
 
     def _pull_sample(self):
-        return self._sink.emit("pull-sample")
+        """One sample, or None if the source handed over nothing before the deadline.
+
+        try-pull-sample rather than pull-sample, which blocks for ever. That is half of
+        what kept the 2026-08-09 failure silent: a source producing nothing and a source
+        about to produce something are the same call that has not returned, so the
+        executor thread never came back and no code ran to notice.
+        """
+        return self._sink.try_pull_sample(int(self._stall_deadline * Gst.SECOND))
 
     async def recv(self) -> VideoFrame:
         loop = asyncio.get_running_loop()
-        sample = await loop.run_in_executor(None, self._pull_sample)
-        if sample is None:
-            raise asyncio.CancelledError("Video pipeline ended")
+        while True:
+            sample = await loop.run_in_executor(None, self._pull_sample)
+            if sample is not None:
+                break
+
+            fault = self._fault() if self._fault else ""
+            if fault:
+                # A dead pipeline is worth ending the track over: the receiver is parked
+                # on recv() and would otherwise wait there for the length of the meeting.
+                # Ended, it logs that the track ended and clears its frame, so the room
+                # stops being told a live share is on its way.
+                logger.error(f"The capture pipeline stopped delivering video and will not recover: {fault}")
+                raise asyncio.CancelledError(f"Video pipeline failed: {fault}")
+
+            # A deadline with a clean bus is a stall, not a death. A display can be
+            # briefly idle, and ending a share that is about to come back is the worse
+            # trade - so this is said once and then waited out.
+            if not self._stalled:
+                self._stalled = True
+                logger.warning(f"No video captured in {self._stall_deadline}s and the pipeline reports no error ({self._frames} frames sent so far). Anything receiving this share is seeing a frozen or black picture.")
+
+        if self._stalled:
+            logger.info(f"Video capture recovered and is producing frames again after {self._frames} frames")
+            self._stalled = False
 
         buffer = sample.get_buffer()
         pts_ns = buffer.pts
@@ -93,6 +136,14 @@ class GstVideoStreamTrack(MediaStreamTrack):
         # Reuse the same μs time base as audio for nice alignment
         frame.time_base = Fraction(1, 1_000_000)
         frame.pts = rel_ns // 1_000
+
+        self._frames += 1
+        if self._frames == 1:
+            # The counterpart of "First video frame received from the webpage streamer"
+            # on the bot. With both lines present the two halves are separable from the
+            # logs alone: this one and not that one is WebRTC, neither is capture. Its
+            # absence is exactly why `0 received` was the end of the trail on 2026-08-09.
+            logger.info(f"First video frame captured and sent: {self._width}x{self._height}")
 
         return frame
 
@@ -162,10 +213,10 @@ class WebpageStreamer:
     KEEPALIVE_TIMEOUT_SECONDS = 900
 
     # How long a capture pipeline that has reached PLAYING gets to hand over one frame
-    # before it is treated as dead. Generous next to the 66ms between frames at 15fps,
-    # and short enough to spend twice inside a single /offer without the bot's own 30s
-    # timeout on that request running out.
-    CAPTURE_FIRST_FRAME_SECONDS = 5
+    # before it is treated as dead. One number for both the check made before an offer is
+    # answered and the one a live track makes on every pull - the same question about the
+    # same appsink, so it is not worth two names to disagree over.
+    CAPTURE_FIRST_FRAME_SECONDS = CAPTURE_FRAME_DEADLINE_SECONDS
 
     UPSTREAM_AUDIO_TRACK_KEY = "upstream_audio_track"
 
@@ -203,6 +254,11 @@ class WebpageStreamer:
         # second of every share and writes a WARNING that reads like the reason a share
         # failed. Off from the start when the deployment already knows.
         self._audio_capture_worth_trying = os.getenv("WEBPAGE_STREAMER_CAPTURE_AUDIO", "").strip().lower() not in ("0", "false", "no")
+        # What the current pipeline has complained about, kept rather than left on the
+        # bus. Sticky until a pipeline is built or torn down, because a GStreamer ERROR
+        # is terminal for the pipeline that posted it - a second asker deserves the same
+        # answer as the first, not an empty queue. See `capture_fault`.
+        self._capture_fault = ""
 
     def _video_branch(self, width, height, display_var):
         return f"""
@@ -297,6 +353,9 @@ class WebpageStreamer:
         self._gst_pipeline = pipeline
         self._gst_video_sink = video_sink
         self._gst_audio_sink = audio_sink
+        # A new pipeline complains for itself. Carrying the last one's fault forward
+        # would end the track that is meant to replace it.
+        self._capture_fault = ""
         logger.info(f"GStreamer capture pipeline is PLAYING ({'video and audio' if audio_sink else 'video only'})")
 
         self._video_track = GstVideoStreamTrack(
@@ -304,6 +363,10 @@ class WebpageStreamer:
             width=width,
             height=height,
             framerate=15,
+            # Handed the streamer's reader rather than the pipeline, so a stalled pull
+            # asks the one thing that empties the bus instead of racing it for the error.
+            fault=self.capture_fault,
+            stall_deadline=self.CAPTURE_FIRST_FRAME_SECONDS,
         )
         self._audio_track = GstAudioStreamTrack(sink=self._gst_audio_sink, sample_rate=16000, channels=1) if self._gst_audio_sink else None
 
@@ -311,27 +374,44 @@ class WebpageStreamer:
     def _pull_one_sample(sink, seconds):
         return sink.try_pull_sample(int(seconds * Gst.SECOND))
 
-    def _report_bus_messages(self):
-        """Say whatever the pipeline has been saying since it started playing.
+    def capture_fault(self):
+        """Whatever the pipeline has said since it started playing, and whether it was fatal.
 
         The bus is otherwise only ever read when a state change fails, so an element that
         gives up *after* PLAYING - a source that loses its display, a caps negotiation
         that only fails once the first buffer is pushed - says so into a queue nobody
         empties. That is the shape of the 2026-08-09 failure: a pipeline reported PLAYING,
         produced nothing for 65 seconds, and logged not one line about it.
+
+        This is the **only** place anything pops from that bus, and the reason is that
+        popping is destructive. Two readers would not each see the error; the first would
+        take it and the second would find a clean bus and conclude the pipeline was
+        healthy. So what is read here is remembered on the streamer, and every asker -
+        the check before an offer is answered, /restart_capture, and the live track on a
+        stalled pull - gets the same answer however often they ask.
+
+        Returns the fault as a sentence, or "" while the pipeline has not complained.
         """
         if self._gst_pipeline is None:
-            return
+            return self._capture_fault
+
         bus = self._gst_pipeline.get_bus()
         while True:
             message = bus.timed_pop_filtered(0, Gst.MessageType.ERROR | Gst.MessageType.WARNING | Gst.MessageType.EOS)
             if message is None:
-                return
+                return self._capture_fault
             if message.type == Gst.MessageType.EOS:
                 logger.error("The GStreamer capture pipeline reached end of stream - it will not produce another frame")
+                self._capture_fault = self._capture_fault or "the pipeline reached end of stream"
                 continue
-            error, debug = message.parse_error() if message.type == Gst.MessageType.ERROR else message.parse_warning()
-            logger.error(f"The GStreamer capture pipeline reported {'an error' if message.type == Gst.MessageType.ERROR else 'a warning'} after it started playing: {error.message} [{debug}]")
+            fatal = message.type == Gst.MessageType.ERROR
+            error, debug = message.parse_error() if fatal else message.parse_warning()
+            logger.error(f"The GStreamer capture pipeline reported {'an error' if fatal else 'a warning'} after it started playing: {error.message} [{debug}]")
+            # A warning is logged and nothing more. Elements warn about things they go on
+            # working through, and ending a live share over one would make this change a
+            # new way to lose a picture rather than a way to explain losing one.
+            if fatal:
+                self._capture_fault = self._capture_fault or f"{error.message} [{debug}]"
 
     async def _capture_is_producing_frames(self):
         """Has the pipeline that says it is PLAYING actually handed over a frame?
@@ -348,9 +428,9 @@ class WebpageStreamer:
 
         loop = asyncio.get_running_loop()
         sample = await loop.run_in_executor(None, self._pull_one_sample, sink, self.CAPTURE_FIRST_FRAME_SECONDS)
-        self._report_bus_messages()
+        fault = self.capture_fault()
         if sample is None:
-            logger.error(f"The capture pipeline reached PLAYING but produced no frame in {self.CAPTURE_FIRST_FRAME_SECONDS}s. Anything streamed from it now would be a share of nothing.")
+            logger.error(f"The capture pipeline reached PLAYING but produced no frame in {self.CAPTURE_FIRST_FRAME_SECONDS}s ({fault or 'and reported nothing on its bus'}). Anything streamed from it now would be a share of nothing.")
             return False
         return True
 
@@ -388,6 +468,7 @@ class WebpageStreamer:
             self._gst_audio_sink = None
             self._video_track = None
             self._audio_track = None
+            self._capture_fault = ""
 
     def run(self):
         self._start_display()
@@ -679,7 +760,7 @@ class WebpageStreamer:
             only builds another when it is holding none, so without this a renegotiation
             would be handed the very pipeline that stopped producing.
             """
-            self._report_bus_messages()
+            self.capture_fault()
             # Checked rather than taken on trust, because in the shared deployment this
             # renderer is several meetings' at once: one bot whose own connection went
             # wrong must not be able to take the pipeline out from under the others. A
