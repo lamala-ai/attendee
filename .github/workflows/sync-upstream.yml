@@ -1,0 +1,133 @@
+name: Sync upstream
+
+# The other half of keeping a fork honest. CI proves our own changes work; this notices
+# when attendee-labs/attendee has moved and prepares the catch-up merge.
+#
+# It never pushes to main. This repo builds the bots that sit in live meetings, so what
+# lands on the deployed branch stays a person's decision - all this does is have the
+# merge already made, already pushed, and already proven conflict-free by the time
+# anyone looks at it.
+#
+# It cannot open the pull request itself: the organisation does not allow GitHub Actions
+# to create pull requests. So it pushes the branch and files one issue carrying the link
+# that opens the PR in a click. If that org setting is ever turned on, the issue step can
+# be swapped for `gh pr create` and nothing else here changes.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # 07:00 UTC daily. Quiet when upstream has not moved.
+  workflow_dispatch:      # ...and whenever you want to ask.
+
+permissions:
+  contents: write         # to push the sync branch
+  issues: write           # to say that it is there
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/attendee-labs/attendee.git
+  SYNC_BRANCH: sync/upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # a merge needs the history, not a shallow tip
+
+      - name: Look at what upstream has that we do not
+        id: survey
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --quiet upstream main
+
+          behind=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          if [ "$behind" -eq 0 ]; then
+            echo "Already current with upstream. Nothing to do."
+            echo "work=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A sync branch that already carries both this main and this upstream is the
+          # work of an earlier run that nobody has merged yet. Rebuilding it would push a
+          # fresh merge commit every morning and re-notify about the same catch-up.
+          if git rev-parse --verify --quiet "origin/$SYNC_BRANCH" > /dev/null; then
+            stale_upstream=$(git rev-list --count "origin/$SYNC_BRANCH..upstream/main")
+            stale_main=$(git rev-list --count "origin/$SYNC_BRANCH..HEAD")
+            if [ "$stale_upstream" -eq 0 ] && [ "$stale_main" -eq 0 ]; then
+              echo "$SYNC_BRANCH already covers these $behind commits. Leaving it alone."
+              echo "work=none" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "work=merge" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Upstream is $behind commits ahead"
+            echo
+            git log --oneline --no-merges HEAD..upstream/main | head -40
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Make the merge
+        id: merge
+        if: steps.survey.outputs.work == 'merge'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$SYNC_BRANCH"
+
+          if ! git merge --no-ff --no-edit -m "Merge attendee-labs/attendee into the fork" upstream/main; then
+            git merge --abort
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "conflicts=false" >> "$GITHUB_OUTPUT"
+
+          # Named files, because the whole question a person has here is whether upstream
+          # landed on anything this fork rewrote.
+          {
+            echo
+            echo "### Files this merge changes"
+            echo '```'
+            git diff --stat "origin/main..HEAD"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          git push --force-with-lease origin "$SYNC_BRANCH"
+
+      - name: Say that it is waiting
+        if: steps.merge.outputs.conflicts == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.survey.outputs.behind }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Upstream sync ready: $SYNC_BRANCH"
+          if [ -n "$(gh issue list --state open --search "$title in:title" --json number --jq '.[].number')" ]; then
+            echo "An open sync issue already exists; the branch has been updated under it."
+            exit 0
+          fi
+          {
+            echo "\`$SYNC_BRANCH\` has been rebuilt on top of \`main\` with **$BEHIND** new commits from \`attendee-labs/attendee\`, and it merged without conflicts."
+            echo
+            echo "**[Open the pull request](https://github.com/$REPO/compare/main...$SYNC_BRANCH?expand=1)** - CI runs on it there, which is the point of doing this as a PR rather than a push."
+            echo
+            echo "The [run summary](https://github.com/$REPO/actions/runs/$RUN_ID) lists what came in and which files it touches. The thing worth reading for is whether upstream has landed on anything this fork rewrote - the Zoom and web adapters, the webpage streamer, the presence indicator. While it has not, syncing stays a formality."
+            echo
+            echo "Filed by \`.github/workflows/sync-upstream.yml\`, once per outstanding sync. Closing it without merging means the next upstream commit files a new one."
+          } > /tmp/sync-issue.md
+          gh issue create --title "$title" --body-file /tmp/sync-issue.md
+
+      - name: Say that it needs a person
+        if: steps.merge.outputs.conflicts == 'true'
+        run: |
+          echo "::error::upstream/main no longer merges cleanly into this fork. Someone has to resolve it by hand: git fetch upstream && git merge upstream/main. Nothing was pushed."
+          exit 1
