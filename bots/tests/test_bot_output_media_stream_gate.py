@@ -67,8 +67,7 @@ class BotOutputMediaStreamGateTests(SimpleTestCase):
         self.assertNotIn(
             "getAudioTracks",
             gate,
-            "the readiness gate requires audio again - a video-only webpage stream, "
-            "which is what a host with no sound card produces, will never be rendered",
+            "the readiness gate requires audio again - a video-only webpage stream, which is what a host with no sound card produces, will never be rendered",
         )
 
     def test_the_audio_wiring_is_skipped_when_there_is_no_audio(self):
@@ -79,9 +78,7 @@ class BotOutputMediaStreamGateTests(SimpleTestCase):
         wiring = play.index("createMediaStreamSource")
         guard = play.rindex("getAudioTracks().length", 0, wiring)
 
-        self.assertGreater(
-            wiring, guard, "createMediaStreamSource is reached without checking for audio"
-        )
+        self.assertGreater(wiring, guard, "createMediaStreamSource is reached without checking for audio")
 
     def test_waiting_for_a_stream_that_never_comes_gives_up_and_says_so(self):
         """An unbounded wait is indistinguishable from a stream still on its way, which

@@ -284,11 +284,7 @@ class WebpageStreamer:
             height=height,
             framerate=15,
         )
-        self._audio_track = (
-            GstAudioStreamTrack(sink=self._gst_audio_sink, sample_rate=16000, channels=1)
-            if self._gst_audio_sink
-            else None
-        )
+        self._audio_track = GstAudioStreamTrack(sink=self._gst_audio_sink, sample_rate=16000, channels=1) if self._gst_audio_sink else None
 
     def _stop_gstreamer_capture(self):
         if self._gst_pipeline:
