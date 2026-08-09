@@ -8,6 +8,8 @@ logger = logging.getLogger(__name__)
 import asyncio
 import contextlib
 import os
+import shutil
+import tempfile
 import time
 from fractions import Fraction
 
@@ -237,6 +239,7 @@ class WebpageStreamer:
         video_frame_size,
     ):
         self.driver = None
+        self._profile_dir = None
         self.video_frame_size = video_frame_size
         self.display_var_for_recording = None
         self.display = None
@@ -522,7 +525,15 @@ class WebpageStreamer:
         options.add_argument("--disable-application-cache")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--enable-blink-features=WebCodecs,WebRTC-InsertableStreams,-AutomationControlled")
-        options.add_argument("--remote-debugging-port=9222")
+        # A per-bot streamer sharing a host with other bots' streamers is a second
+        # process wanting Chrome's default profile directory - the second one to start
+        # gets "session not created: probably user data directory is already in use"
+        # and never starts at all. One shared process never had two Chromes to collide,
+        # so this only surfaces now that every bot spawns its own. A fresh temp
+        # directory per launch sidesteps it the same way the caller already picks a
+        # fresh port per launch.
+        self._profile_dir = tempfile.mkdtemp(prefix="webpage-streamer-profile-")
+        options.add_argument(f"--user-data-dir={self._profile_dir}")
 
         if os.getenv("ENABLE_CHROME_SANDBOX_FOR_WEBPAGE_STREAMER", "true").lower() != "true":
             options.add_argument("--no-sandbox")
@@ -562,6 +573,7 @@ class WebpageStreamer:
     def _stop_browser(self):
         """Quit Chrome and forget it, so the next request starts a fresh one."""
         driver, self.driver = self.driver, None
+        profile_dir, self._profile_dir = self._profile_dir, None
         if driver is None:
             return
         try:
@@ -570,6 +582,12 @@ class WebpageStreamer:
             # Whatever went wrong, the driver is not ours any more - keeping the handle
             # would only mean handing a dead browser to the next request.
             logger.warning(f"Error quitting the browser: {e}")
+        if profile_dir:
+            # A shared streamer releases and reacquires a browser many times over one
+            # process's life (idle release, restart_stream), and each acquisition mints
+            # a fresh profile directory - left behind, that is a slow leak of exactly
+            # the kind that once ran a worker up to 7.99 of an 8 GB limit.
+            shutil.rmtree(profile_dir, ignore_errors=True)
 
     async def _ensure_browser(self):
         """The browser a request needs, started if an idle release gave it back.
@@ -658,8 +676,7 @@ class WebpageStreamer:
         """Gracefully shutdown the process."""
         try:
             self._stop_gstreamer_capture()
-            if self.driver:
-                self.driver.quit()
+            self._stop_browser()
             if self.display:
                 self.display.stop()
             if self.web_app:
