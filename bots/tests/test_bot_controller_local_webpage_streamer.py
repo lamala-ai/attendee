@@ -7,9 +7,10 @@ launch and teardown in isolation, without constructing the rest of BotController
 (gstreamer pipeline, adapter, websocket manager, ...), which this logic never touches.
 """
 
+import signal
 import subprocess
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from django.test import SimpleTestCase
 
@@ -43,6 +44,9 @@ class TestLaunchLocalWebpageStreamer(SimpleTestCase):
         script_path = args[0][1]
         self.assertTrue(script_path.endswith("webpage_streamer/run_webpage_streamer.py") or script_path.endswith("webpage_streamer\\run_webpage_streamer.py"))
         self.assertEqual(kwargs["env"]["WEBPAGE_STREAMER_PORT"], str(port))
+        # Its own process group, or cleanup can only ever reach the Python interpreter -
+        # not the Xvfb/Chrome/chromedriver it spawns underneath itself.
+        self.assertTrue(kwargs["start_new_session"])
 
     def test_two_launches_get_different_ports(self):
         """The whole point: two bots on the same host must not collide the way the
@@ -84,47 +88,66 @@ class TestLaunchLocalWebpageStreamer(SimpleTestCase):
 
 
 class TestCleanupLocalWebpageStreamerProcess(SimpleTestCase):
+    """Cleanup signals the whole process group (os.killpg), not just the Python
+    interpreter's own PID (process.terminate()) - Xvfb, Chrome and chromedriver are
+    that interpreter's children, not this bot's, and a plain terminate() leaves every
+    one of them running as an orphan. start_new_session=True at launch is what makes
+    the interpreter's own pid double as its process group id."""
+
     def test_does_nothing_when_no_process_was_started(self):
         controller = make_controller()
         controller._cleanup_local_webpage_streamer_process()  # must not raise
 
-    def test_terminates_and_waits_for_the_process(self):
+    def test_signals_the_process_group_and_waits(self):
         controller = make_controller()
         process = MagicMock(pid=1234)
         process.wait.return_value = 0
         controller._local_webpage_streamer_process = process
 
-        controller._cleanup_local_webpage_streamer_process()
+        with patch("bots.bot_controller.bot_controller.os.getpgid", return_value=1234) as getpgid, patch("bots.bot_controller.bot_controller.os.killpg") as killpg:
+            controller._cleanup_local_webpage_streamer_process()
 
-        process.terminate.assert_called_once()
+        getpgid.assert_called_once_with(1234)
+        killpg.assert_called_once_with(1234, signal.SIGTERM)
         process.wait.assert_called_once()
-        process.kill.assert_not_called()
         self.assertIsNone(controller._local_webpage_streamer_process)
 
-    def test_escalates_to_kill_when_terminate_does_not_land(self):
+    def test_escalates_to_sigkill_when_sigterm_does_not_land(self):
         controller = make_controller()
         process = MagicMock(pid=1234)
         process.wait.side_effect = [subprocess.TimeoutExpired(cmd="run_webpage_streamer.py", timeout=10), 0]
         controller._local_webpage_streamer_process = process
 
-        controller._cleanup_local_webpage_streamer_process()
+        with patch("bots.bot_controller.bot_controller.os.getpgid", return_value=1234), patch("bots.bot_controller.bot_controller.os.killpg") as killpg:
+            controller._cleanup_local_webpage_streamer_process()
 
-        process.terminate.assert_called_once()
-        process.kill.assert_called_once()
+        killpg.assert_has_calls([call(1234, signal.SIGTERM), call(1234, signal.SIGKILL)])
         self.assertEqual(process.wait.call_count, 2)
+
+    def test_a_process_group_that_is_already_gone_does_not_raise(self):
+        """The subprocess can die on its own between launch and cleanup - getpgid on a
+        pid nobody holds any more is the normal shape of that, not an error to surface."""
+        controller = make_controller()
+        process = MagicMock(pid=1234)
+        controller._local_webpage_streamer_process = process
+
+        with patch("bots.bot_controller.bot_controller.os.getpgid", side_effect=ProcessLookupError()):
+            controller._cleanup_local_webpage_streamer_process()  # must not raise
+
+        self.assertIsNone(controller._local_webpage_streamer_process)
 
     def test_cleaning_up_one_bots_process_does_not_touch_another_bots(self):
         """The collision this whole design exists to avoid, checked from the teardown
         side: terminating one bot's streamer must never reach for another bot's handle."""
         controller_a, controller_b = make_controller(1), make_controller(2)
-        process_a, process_b = MagicMock(pid=1), MagicMock(pid=2)
+        process_a, process_b = MagicMock(pid=101), MagicMock(pid=102)
         process_a.wait.return_value = 0
         controller_a._local_webpage_streamer_process = process_a
         controller_b._local_webpage_streamer_process = process_b
 
-        controller_a._cleanup_local_webpage_streamer_process()
+        with patch("bots.bot_controller.bot_controller.os.getpgid", return_value=101), patch("bots.bot_controller.bot_controller.os.killpg") as killpg:
+            controller_a._cleanup_local_webpage_streamer_process()
 
-        process_a.terminate.assert_called_once()
-        process_b.terminate.assert_not_called()
+        killpg.assert_called_once_with(101, signal.SIGTERM)
         self.assertIsNone(controller_a._local_webpage_streamer_process)
         self.assertIs(controller_b._local_webpage_streamer_process, process_b)

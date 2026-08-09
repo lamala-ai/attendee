@@ -942,9 +942,18 @@ class BotController:
             # log stream, not disappear. A silent subprocess and a healthy one that
             # just hasn't answered /keepalive yet look identical from here, and 2026-08-09
             # spent several minutes indistinguishable from the other.
+            #
+            # start_new_session=True makes this subprocess a process group leader, so
+            # the Xvfb, Chrome and chromedriver it spawns are its own children rather
+            # than ours - process.terminate() below only reaches this one PID, and
+            # without a group of its own, everything underneath it would be orphaned
+            # rather than killed. An orphaned Xvfb+Chrome from one failed attempt is
+            # exactly the kind of resource that makes the next attempt slow or wedged
+            # for reasons that look nothing like the original failure.
             process = subprocess.Popen(
                 [sys.executable, script],
                 env=child_env,
+                start_new_session=True,
             )
         except OSError as e:
             logger.error(f"Bot {self.bot_in_db.id}: could not start local webpage streamer: {e}")
@@ -961,18 +970,34 @@ class BotController:
         nothing else depends on it staying up, and owning the handle directly means an
         unresponsive HTTP server can't leak it the way it could when nothing but a
         network call could reach it.
+
+        Signals the whole process group (start_new_session=True at launch made this
+        subprocess its leader), not just the one PID - Xvfb, Chrome and chromedriver
+        are this subprocess's own children, not ours, and a plain terminate() on the
+        Python interpreter leaves every one of them running as an orphan. Python does
+        not forward SIGTERM to children it did not spawn directly, and none of
+        pyvirtualdisplay or Selenium run cleanup code on a signal they never see.
         """
         process, self._local_webpage_streamer_process = self._local_webpage_streamer_process, None
         if process is None:
             return
 
         logger.info(f"Terminating local webpage streamer (pid {process.pid})...")
-        process.terminate()
         try:
+            pgid = os.getpgid(process.pid)
+        except ProcessLookupError:
+            return
+        try:
+            os.killpg(pgid, signal.SIGTERM)
             process.wait(timeout=10)
+        except ProcessLookupError:
+            pass
         except subprocess.TimeoutExpired:
-            logger.warning("Local webpage streamer did not exit after terminate(), killing it")
-            process.kill()
+            logger.warning("Local webpage streamer did not exit after SIGTERM, killing its process group")
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             process.wait(timeout=10)
 
     def run(self):
