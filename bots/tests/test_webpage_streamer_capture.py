@@ -31,7 +31,12 @@ from bots.webpage_streamer.webpage_streamer import (
     GstVideoStreamTrack,
 )
 
-WIDTH, HEIGHT = 4, 2
+# Big enough that av's plane buffers are exactly w*h and w*h/4, which is what recv()
+# slices the GStreamer buffer into. Below a 32-aligned width av pads the planes and
+# the slices no longer fill them - 4x2 asks for 8 bytes into a 32-byte plane. The
+# real capture is 1280x720, which is aligned, so this is a property of the fixture
+# rather than of the code under test.
+WIDTH, HEIGHT = 64, 32
 
 
 def a_sample():
