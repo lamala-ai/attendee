@@ -934,6 +934,16 @@ class BotController:
         child_env.pop("WEBPAGE_STREAMER_IS_SHARED", None)
         child_env.pop("DISPLAY", None)
         child_env["WEBPAGE_STREAMER_PORT"] = str(port)
+        # webpage_streamer.py's own default bind host is "::" (every interface, every
+        # family) because the shared/Kubernetes deployments are reached over Railway's
+        # private network, where that dual-stack behavior matters. This process is only
+        # ever reached from this bot, over 127.0.0.1 - and on at least one container
+        # environment here, a "::"-bound socket refused v4-mapped connections to
+        # 127.0.0.1 outright (ECONNREFUSED against a server that had, by every other
+        # sign in its own logs, started and bound successfully). Binding the loopback
+        # address directly sidesteps the dual-stack question entirely instead of
+        # depending on it working the way the shared deployment's own comment assumes.
+        child_env["WEBPAGE_STREAMER_BIND_HOST"] = "127.0.0.1"
 
         try:
             # No stdout/stderr redirection: whatever this subprocess logs (its own
