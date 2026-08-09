@@ -2271,6 +2271,10 @@ class TranscriptionProviders(models.IntegerChoices):
     KYUTAI = 8, "Kyutai"
     CUSTOM_ASYNC = 9, "Custom Async"
     CUSTOM_ASYNC_V2 = 10, "Custom Async v2"
+    # Not a provider: the explicit absence of one. A bot that transcribes elsewhere still
+    # has to name something here, because every other value would have it run a
+    # transcription pipeline whose only output is a failure per utterance.
+    NO_TRANSCRIPTION = 11, "No Transcription"
 
 
 class RecordingStorage(Storage):

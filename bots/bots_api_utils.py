@@ -285,11 +285,12 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
                 calendar_event=calendar_event,
             )
 
+            transcription_provider = transcription_provider_from_bot_creation_data(serializer.validated_data)
             Recording.objects.create(
                 bot=bot,
                 recording_type=bot.recording_type(),
-                transcription_type=TranscriptionTypes.NON_REALTIME,
-                transcription_provider=transcription_provider_from_bot_creation_data(serializer.validated_data),
+                transcription_type=TranscriptionTypes.NO_TRANSCRIPTION if transcription_provider == TranscriptionProviders.NO_TRANSCRIPTION else TranscriptionTypes.NON_REALTIME,
+                transcription_provider=transcription_provider,
                 is_default_recording=True,
             )
 

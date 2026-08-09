@@ -176,6 +176,12 @@ class RealtimePerParticipantVideoFrameGenerator:
 
         for participant_id in participant_ids:
             participant = self.get_participants_ctrl_callback().GetUserByUserID(participant_id)
+            if participant is None:
+                # The id list is a snapshot. Somebody who left between taking it and
+                # asking about them has no user object any more, and at teardown nobody
+                # does - which is how a routine 4-second refresh used to end the meeting's
+                # logs with an AttributeError on 'NoneType'.
+                continue
             if participant.IsVideoOn() and webcam_configuration.enabled:
                 desired_subscription_ids.add((participant_id, None))
 

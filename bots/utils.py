@@ -484,7 +484,10 @@ def transcription_provider_from_bot_creation_data(data):
     settings = data.get("transcription_settings", {})
     use_zoom_web_adapter = data.get("zoom_settings", {}).get("sdk") == "web"
 
-    if "deepgram" in settings:
+    # First, and on its own: saying "none" is saying it about everything else too.
+    if "none" in settings:
+        return TranscriptionProviders.NO_TRANSCRIPTION
+    elif "deepgram" in settings:
         return TranscriptionProviders.DEEPGRAM
     elif "gladia" in settings:
         return TranscriptionProviders.GLADIA
