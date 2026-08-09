@@ -188,3 +188,202 @@ class TestStoppingTheShare(WebpageStreamerShareSourceTestCase):
 
         self.assertTrue(any("no share left to stop" in line for line in logs.output))
         self.assertFalse(self.share_source._sharing_started)
+
+class FakeShareSender:
+    """The object Zoom hands to onStartSend. Records what it was asked to send."""
+
+    def __init__(self, result=SDKERR_SUCCESS):
+        self.result = result
+        self.frames = []
+
+    def sendShareFrame(self, frame_bytes, width, height, frame_format):
+        self.frames.append((frame_bytes, width, height, frame_format))
+        return self.result
+
+
+class FakeClock:
+    """Stands in for the module's ``time``. It only ever calls ``monotonic``."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class TestSayingWhenTheRoomSeesNothing(WebpageStreamerShareSourceTestCase):
+    """The share that registered, started, and delivered nothing.
+
+    On 2026-08-09 a Zoom meeting watched a black screen for the length of a share while
+    every log line on the path said success: the page was fetched and long-polled by the
+    renderer throughout, setExternalShareSource returned SDKERR_SUCCESS, onStartSend
+    fired, and the pump was scheduled. The pump then ran roughly 2,300 times over 76
+    seconds and logged nothing at all, because both of its give-up paths - no sender, no
+    frame - are a bare ``return True``, and the only outcome it reports is a
+    sendShareFrame that fails. There was no way to tell from the logs whether frames were
+    never arriving, never converting, or being sent and dropped by Zoom.
+
+    Every test here fails against that behaviour: none of these lines existed.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.clock = FakeClock()
+        self.sender = FakeShareSender()
+
+    def start_sharing(self):
+        with self.zoom_patch():
+            self.share_source.play_bot_output_media_stream("screenshare")
+        self.share_source.on_share_start_send_callback(self.sender)
+
+    def pump(self, times=1):
+        with self.zoom_patch():
+            for _ in range(times):
+                self.share_source._pump_frame()
+
+    def clock_patch(self):
+        return patch("bots.zoom_bot_adapter.webpage_streamer_share_source.time", self.clock)
+
+    def logs(self, level="INFO"):
+        return self.assertLogs("bots.zoom_bot_adapter.webpage_streamer_share_source", level=level)
+
+    def test_a_share_delivering_nothing_says_so_once_the_deadline_passes(self):
+        with self.clock_patch():
+            self.start_sharing()
+            self.clock.advance(16)  # SHARE_FIRST_FRAME_DEADLINE_SECONDS is 15
+            with self.logs(level="WARNING") as logs:
+                self.pump()
+
+        self.assertTrue(any("The room is not seeing the shared page" in line for line in logs.output))
+
+    def test_nothing_is_said_before_the_deadline(self):
+        """A share is entitled to a cold browser start and a first keyframe."""
+        with self.clock_patch():
+            self.start_sharing()
+            self.clock.advance(5)
+            self.pump(times=150)  # ~5s of ticks, all of them empty
+
+        self.assertFalse(self.share_source._warned_about_no_frames)
+
+    def test_the_warning_says_no_frames_arrived_over_webrtc(self):
+        """Nothing received is the receiving half - aiortc or the connection itself."""
+        with self.clock_patch():
+            self.start_sharing()
+            self.clock.advance(16)
+            with self.logs(level="WARNING") as logs:
+                self.pump()
+
+        self.assertIn("0 received from the webpage streamer", logs.output[0])
+        self.assertIn("0 converted to I420", logs.output[0])
+
+    def test_the_warning_distinguishes_frames_that_arrived_but_never_converted(self):
+        """Received climbing with converted stuck at zero is the I420 conversion, which
+        is a different bug in a different thread from an empty connection."""
+        self.share_source.latest_frame.note_received()
+        self.share_source.latest_frame.note_received()
+        with self.clock_patch():
+            self.start_sharing()
+            self.clock.advance(16)
+            with self.logs(level="WARNING") as logs:
+                self.pump()
+
+        self.assertIn("2 received from the webpage streamer", logs.output[0])
+        self.assertIn("0 converted to I420", logs.output[0])
+
+    def test_the_warning_counts_frames_zoom_rejected(self):
+        """Converted and sent but refused is the third half, and the pump's existing
+        rate-limited line only ever shows the code, never how many."""
+        self.sender.result = SDKERR_WRONG_USAGE
+        self.share_source.latest_frame.put(b"i420", 1280, 720)
+        with self.clock_patch():
+            self.start_sharing()
+            self.clock.advance(16)
+            with self.logs(level="WARNING") as logs:
+                self.pump()
+
+        self.assertIn("1 converted to I420", logs.output[-1])
+        self.assertIn("rejected by sendShareFrame", logs.output[-1])
+
+    def test_the_warning_is_said_once_however_long_it_goes_on(self):
+        """At 30fps a per-tick warning would be the whole log."""
+        with self.clock_patch():
+            self.start_sharing()
+            self.clock.advance(60)
+            with self.logs(level="WARNING") as logs:
+                self.pump(times=500)
+
+        self.assertEqual(len([line for line in logs.output if "not seeing" in line]), 1)
+
+    def test_a_share_that_is_working_is_never_warned_about(self):
+        self.share_source.latest_frame.put(b"i420", 1280, 720)
+        with self.clock_patch():
+            self.start_sharing()
+            self.pump()
+            self.clock.advance(600)
+            self.pump(times=100)
+
+        self.assertFalse(self.share_source._warned_about_no_frames)
+        self.assertEqual(len(self.sender.frames), 101)
+
+    def test_the_first_frame_zoom_accepts_is_announced(self):
+        """Until this line appears, every success reported on this path is about
+        registering a share rather than filling one."""
+        self.share_source.latest_frame.put(b"i420", 1280, 720)
+        with self.clock_patch():
+            self.start_sharing()
+            with self.logs() as logs:
+                self.pump()
+
+        self.assertTrue(any("First frame accepted by Zoom: 1280x720" in line for line in logs.output))
+
+    def test_the_first_frame_is_announced_only_once(self):
+        self.share_source.latest_frame.put(b"i420", 1280, 720)
+        with self.clock_patch():
+            self.start_sharing()
+            with self.logs() as logs:
+                self.pump(times=50)
+
+        self.assertEqual(len([line for line in logs.output if "First frame accepted" in line]), 1)
+
+    def test_a_second_share_is_judged_on_its_own_delivery(self):
+        """The counters are reset by onStartSend, so a first share that worked cannot
+        vouch for a second one that does not."""
+        self.share_source.latest_frame.put(b"i420", 1280, 720)
+        with self.clock_patch():
+            self.start_sharing()
+            self.pump()
+            self.share_source.on_share_stop_send_callback()
+            self.share_source.latest_frame.clear()
+            self.share_source.on_share_start_send_callback(self.sender)
+            self.clock.advance(16)
+            with self.logs(level="WARNING") as logs:
+                self.pump()
+
+        self.assertTrue(any("The room is not seeing the shared page" in line for line in logs.output))
+
+
+class TestCountingFrames(WebpageStreamerShareSourceTestCase):
+    def test_receiving_and_converting_are_counted_separately(self):
+        """Both are needed to place a failure: the receiver counts a frame off the track
+        before touching it, and only a successful conversion counts as converted."""
+        frame = self.share_source.latest_frame
+        self.assertEqual(frame.counts(), (0, 0))
+
+        frame.note_received()
+        self.assertEqual(frame.counts(), (1, 0))  # arrived, conversion still to come
+
+        frame.put(b"i420", 1280, 720)
+        self.assertEqual(frame.counts(), (1, 1))
+
+    def test_the_counts_survive_the_frame_being_cleared(self):
+        """clear() drops the buffer at the end of a track; it is not a fresh share, and
+        the counts are the record of what that share did."""
+        frame = self.share_source.latest_frame
+        frame.note_received()
+        frame.put(b"i420", 1280, 720)
+        frame.clear()
+
+        self.assertEqual(frame.counts(), (1, 1))

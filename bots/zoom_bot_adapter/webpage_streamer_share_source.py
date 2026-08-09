@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 
 import zoom_meeting_sdk as zoom
 
@@ -44,6 +45,17 @@ DEFAULT_SHARE_HEIGHT = 720
 # has arrived, because Zoom stops showing a share that goes quiet.
 SHARE_FRAME_INTERVAL_MS = 33
 
+# How long a share Zoom has accepted may deliver nothing before the log says so. Well
+# past a cold browser start and a first keyframe - the streamer's own page-load budget is
+# 8s - so this is never the ordinary first second of a share, and short enough that it
+# lands while the meeting it is ruining is still happening.
+SHARE_FIRST_FRAME_DEADLINE_SECONDS = 15
+
+# Frames between "still alive" lines. At SHARE_FRAME_INTERVAL_MS that is about once a
+# minute: enough to tell a live share from a stopped one in a log after the fact, not
+# enough to become the log.
+SHARE_PROGRESS_EVERY_N_FRAMES = 1800
+
 
 class LatestFrame:
     """The one place the aiortc thread and the GLib thread touch.
@@ -51,6 +63,11 @@ class LatestFrame:
     Holds the newest I420 frame and nothing else. ``take`` returns it and reports
     whether it is new, so the pump can re-send an unchanged frame to keep the share
     alive without pretending it received something.
+
+    It also keeps the two counts, because it is already the one object both threads hold
+    a lock on and the pump has to read a number the receiver writes. They exist to tell
+    the silent failures apart: nothing arriving over WebRTC leaves both at zero, while a
+    conversion that keeps raising leaves ``received`` climbing and ``converted`` at zero.
     """
 
     def __init__(self):
@@ -58,12 +75,27 @@ class LatestFrame:
         self._frame = None
         self._size = (DEFAULT_SHARE_WIDTH, DEFAULT_SHARE_HEIGHT)
         self._fresh = False
+        self._received = 0
+        self._converted = 0
+
+    def note_received(self) -> int:
+        """Count a frame off the track, before anything is done to it. Returns the new
+        total so the receiver can recognise the first one without a second lock."""
+        with self._lock:
+            self._received += 1
+            return self._received
+
+    def counts(self):
+        """(received, converted), read together so they cannot disagree."""
+        with self._lock:
+            return self._received, self._converted
 
     def put(self, frame_bytes: bytes, width: int, height: int) -> None:
         with self._lock:
             self._frame = frame_bytes
             self._size = (width, height)
             self._fresh = True
+            self._converted += 1
 
     def take(self):
         with self._lock:
@@ -111,6 +143,9 @@ class WebpageStreamerShareSource:
         self._pump_timeout_id = None
         self._sharing_started = False
         self._send_failure_ticker = 0
+        self._frames_sent = 0
+        self._sharing_since = None
+        self._warned_about_no_frames = False
 
     # --- lifecycle -----------------------------------------------------
 
@@ -210,6 +245,8 @@ class WebpageStreamerShareSource:
                 logger.info("Webpage streamer video track ended")
                 self.latest_frame.clear()
                 return
+            if self.latest_frame.note_received() == 1:
+                logger.info(f"First video frame received from the webpage streamer: {frame.width}x{frame.height}")
             try:
                 array = frame.to_ndarray(format="yuv420p")
                 self.latest_frame.put(array.tobytes(), frame.width, frame.height)
@@ -267,6 +304,11 @@ class WebpageStreamerShareSource:
         """Zoom is ready for frames. Nothing may be sent before this fires."""
         logger.info("on_share_start_send_callback called")
         self.share_sender = share_sender
+        # Reset here rather than in __init__ alone, so a second share in one meeting is
+        # judged on its own delivery instead of inheriting the first one's.
+        self._sharing_since = time.monotonic()
+        self._frames_sent = 0
+        self._warned_about_no_frames = False
         if self._pump_timeout_id is None:
             self._pump_timeout_id = self._schedule(SHARE_FRAME_INTERVAL_MS, self._pump_frame)
 
@@ -282,6 +324,8 @@ class WebpageStreamerShareSource:
         self._stop_pump()
         self.share_sender = None
         self._sharing_started = False
+        # A share that is over is not a share that is failing to deliver.
+        self._sharing_since = None
 
     def on_share_start_send_audio_callback(self, audio_sender):
         """Required by the SDK, deliberately silent. See the note in
@@ -302,6 +346,7 @@ class WebpageStreamerShareSource:
             return True
         frame_bytes, (width, height), _fresh = self.latest_frame.take()
         if frame_bytes is None:
+            self._warn_if_the_room_is_seeing_nothing()
             return True
         try:
             result = self.share_sender.sendShareFrame(frame_bytes, width, height, zoom.FrameDataFormat_I420_FULL)
@@ -312,9 +357,46 @@ class WebpageStreamerShareSource:
                 if self._send_failure_ticker % 100 == 0:
                     logger.info(f"sendShareFrame failed with result = {result}")
                 self._send_failure_ticker += 1
+                self._warn_if_the_room_is_seeing_nothing()
+                return True
+            self._note_frame_sent(width, height)
         except Exception:
             logger.exception("sendShareFrame raised")
         return True
+
+    def _note_frame_sent(self, width: int, height: int) -> None:
+        """Say once that the share is real, and rarely that it still is.
+
+        The first line is the one worth having: until it appears, every success this
+        module has reported is about registering a share rather than filling it.
+        """
+        self._frames_sent += 1
+        if self._frames_sent == 1:
+            received, converted = self.latest_frame.counts()
+            logger.info(f"First frame accepted by Zoom: {width}x{height} ({received} received, {converted} converted). The room can see the page.")
+        elif self._frames_sent % SHARE_PROGRESS_EVERY_N_FRAMES == 0:
+            received, converted = self.latest_frame.counts()
+            logger.info(f"Webpage streamer share still delivering: {self._frames_sent} frames sent, {received} received, {converted} converted")
+
+    def _warn_if_the_room_is_seeing_nothing(self) -> None:
+        """Report, once, a share Zoom accepted that is not showing anything.
+
+        This is the gap that let a live meeting watch a black screen for its whole
+        length while every line in the log said success. setExternalShareSource returned
+        SDKERR_SUCCESS, onStartSend fired, the pump was scheduled - and then found an
+        empty slot thirty times a second and returned quietly, which reads exactly like a
+        healthy share. Roughly 2,300 of those ticks produced no output at all.
+
+        The counts are in the message because they say which half is at fault, and the
+        three of them cannot be recovered afterwards from anything else that is logged.
+        """
+        if self._frames_sent or self._warned_about_no_frames or self._sharing_since is None:
+            return
+        if time.monotonic() - self._sharing_since < SHARE_FIRST_FRAME_DEADLINE_SECONDS:
+            return
+        self._warned_about_no_frames = True
+        received, converted = self.latest_frame.counts()
+        logger.warning(f"The room is not seeing the shared page: Zoom accepted the share {SHARE_FIRST_FRAME_DEADLINE_SECONDS}s ago and no frame has reached it since ({received} received from the webpage streamer, {converted} converted to I420, {self._send_failure_ticker} rejected by sendShareFrame). Nothing received means the frames are not arriving over WebRTC; received but not converted means the I420 conversion is failing; converted but not sent means Zoom is rejecting them.")
 
     def _stop_pump(self):
         if self._pump_timeout_id is not None:
@@ -326,6 +408,7 @@ class WebpageStreamerShareSource:
     def stop_bot_output_media_stream(self, output_destination=None):
         self._stop_pump()
         self.latest_frame.clear()
+        self._sharing_since = None
         if self._sharing_started and self.meeting_service:
             try:
                 # StopShare on the share controller, not setExternalShareSource(None).
