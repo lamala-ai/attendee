@@ -34,6 +34,19 @@ const PRESENCE_PLATE_COLOR = "#14110D";
 const PRESENCE_PLATE_ALPHA = 0.62;
 const PRESENCE_LABEL_COLOR = "#F7F8F8";
 const PRESENCE_LABEL_ALPHA = 0.96;
+// The task pills stacked above that word - what the seat is working on, and the latest
+// word on each. Second-tier on purpose: dimmer plate, dimmer ink, smaller type, so a
+// gallery-view glance still reads only WORKING. See the same block in the Python.
+const PRESENCE_TASK_WIDTH = 0.62;
+const PRESENCE_TASK_HEIGHT = 0.062;
+const PRESENCE_TASK_GAP = 0.014;
+const PRESENCE_TASK_FILL_WIDTH = 0.9;
+const PRESENCE_TASK_FILL_HEIGHT = 0.4;
+const PRESENCE_TASK_PLATE_ALPHA = 0.5;
+const PRESENCE_TASK_COLOR = "#E8E6DE";
+const PRESENCE_TASK_ALPHA = 0.88;
+const PRESENCE_TASK_NOTE_COLOR = "#B9B3A4";
+const PRESENCE_TASK_NOTE_ALPHA = 0.86;
 
 // Holds the state of a bot video output stream. We need this class because there are two bot video output streams, one for webcam and one for screenshare.
 class BotVideoOutputStream {
@@ -69,6 +82,7 @@ class BotVideoOutputStream {
         // bots/presence_indicator.py - the colours, the periods and the geometry are
         // that module's, repeated here so a tile looks the same on every platform.
         this.presenceState = null;
+        this.presenceTasks = [];
         this.presenceChangedAt = 0;
 
         this.canvasCtx.fillStyle = "black";
@@ -437,13 +451,19 @@ class BotVideoOutputStream {
         }, this._redrawIntervalMs());
     }
 
-    setPresenceIndicator(state) {
-        if (state === this.presenceState) {
+    setPresenceIndicator(state, tasks) {
+        const nextTasks = Array.isArray(tasks) ? tasks : [];
+        if (state === this.presenceState && JSON.stringify(nextTasks) === JSON.stringify(this.presenceTasks)) {
             return;
         }
+        // The pulse is timed from a *state* change and not from this call: a progress
+        // note lands every few seconds while an errand runs, and restarting the fade on
+        // each one would make the glow stutter every time the agent said anything.
+        if (state !== this.presenceState) {
+            this.presenceChangedAt = performance.now();
+        }
         this.presenceState = state;
-        // Timed from the change, so a state always starts its pulse lit.
-        this.presenceChangedAt = performance.now();
+        this.presenceTasks = nextTasks;
         if (this.imageToDraw && this.imageDrawParams) {
             // Repaint at once, so a state that stops drawing takes the glow off the tile
             // now rather than at the next tick.
@@ -512,34 +532,100 @@ class BotVideoOutputStream {
         const boxHeight = side * PRESENCE_LABEL_HEIGHT;
         const boxLeft = offsetX + (width - boxWidth) / 2;
         const boxTop = offsetY + height - side * PRESENCE_LABEL_INSET - boxHeight;
-        const radius = boxHeight / 2;
-        ctx.globalAlpha = PRESENCE_PLATE_ALPHA;
+        this._drawPresencePill({
+            left: boxLeft,
+            top: boxTop,
+            width: boxWidth,
+            height: boxHeight,
+            text: PRESENCE_LABELS[this.presenceState],
+            plateAlpha: PRESENCE_PLATE_ALPHA,
+            color: PRESENCE_LABEL_COLOR,
+            alpha: PRESENCE_LABEL_ALPHA,
+            fillWidth: PRESENCE_LABEL_FILL_WIDTH,
+            fillHeight: PRESENCE_LABEL_FILL_HEIGHT,
+            weight: 700,
+        });
+
+        // What it is working on, stacked upward from that word. Upward because the
+        // bottom of a tile belongs to the meeting client, which writes the participant's
+        // name there.
+        const rows = this._presenceTaskRows();
+        const taskWidth = side * PRESENCE_TASK_WIDTH;
+        const taskHeight = side * PRESENCE_TASK_HEIGHT;
+        const gap = side * PRESENCE_TASK_GAP;
+        const taskLeft = offsetX + (width - taskWidth) / 2;
+        rows.forEach((row, index) => {
+            const bottom = boxTop - gap - (rows.length - 1 - index) * (taskHeight + gap);
+            const top = bottom - taskHeight;
+            if (top < offsetY) {
+                return;
+            }
+            this._drawPresencePill({
+                left: taskLeft,
+                top: top,
+                width: taskWidth,
+                height: taskHeight,
+                text: row.text,
+                plateAlpha: PRESENCE_TASK_PLATE_ALPHA,
+                color: row.color,
+                alpha: row.alpha,
+                fillWidth: PRESENCE_TASK_FILL_WIDTH,
+                fillHeight: PRESENCE_TASK_FILL_HEIGHT,
+                weight: 500,
+            });
+        });
+        ctx.restore();
+    }
+
+    /** The task pills flattened to the lines that get drawn, each with its own ink.
+     *  A note is its own line under its task rather than part of it: one long pill at
+     *  this size is a smear, and two short ones are not. */
+    _presenceTaskRows() {
+        const rows = [];
+        for (const task of this.presenceTasks || []) {
+            const text = typeof task === "string" ? task : task && task.text;
+            if (!text) {
+                continue;
+            }
+            rows.push({ text: text, color: PRESENCE_TASK_COLOR, alpha: PRESENCE_TASK_ALPHA });
+            const note = task && task.note;
+            if (note) {
+                rows.push({ text: note, color: PRESENCE_TASK_NOTE_COLOR, alpha: PRESENCE_TASK_NOTE_ALPHA });
+            }
+        }
+        return rows;
+    }
+
+    /** One plate with one line of text on it, sized to fit rather than guessed at. */
+    _drawPresencePill({ left, top, width, height, text, plateAlpha, color, alpha, fillWidth, fillHeight, weight }) {
+        const ctx = this.canvasCtx;
+        const radius = height / 2;
+        ctx.globalAlpha = plateAlpha;
         ctx.fillStyle = PRESENCE_PLATE_COLOR;
         ctx.beginPath();
-        ctx.moveTo(boxLeft + radius, boxTop);
-        ctx.lineTo(boxLeft + boxWidth - radius, boxTop);
-        ctx.arc(boxLeft + boxWidth - radius, boxTop + radius, radius, -Math.PI / 2, Math.PI / 2);
-        ctx.lineTo(boxLeft + radius, boxTop + boxHeight);
-        ctx.arc(boxLeft + radius, boxTop + radius, radius, Math.PI / 2, -Math.PI / 2);
+        ctx.moveTo(left + radius, top);
+        ctx.lineTo(left + width - radius, top);
+        ctx.arc(left + width - radius, top + radius, radius, -Math.PI / 2, Math.PI / 2);
+        ctx.lineTo(left + radius, top + height);
+        ctx.arc(left + radius, top + radius, radius, Math.PI / 2, -Math.PI / 2);
         ctx.fill();
 
-        const text = PRESENCE_LABELS[this.presenceState];
         // Sized by measuring rather than guessing, so "LISTENING" and "TALKING" fill the
-        // same plate to the same margins instead of one of them overrunning it.
-        let fontSize = boxHeight * PRESENCE_LABEL_FILL_HEIGHT * 1.4;
-        ctx.font = `700 ${fontSize}px Archivo, Helvetica, Arial, sans-serif`;
+        // same plate to the same margins instead of one of them overrunning it - and so
+        // a task of four words shrinks to fit instead of running off its pill.
+        let fontSize = height * fillHeight * 1.4;
+        ctx.font = `${weight} ${fontSize}px Archivo, Helvetica, Arial, sans-serif`;
         const measured = ctx.measureText(text).width;
-        const room = boxWidth * PRESENCE_LABEL_FILL_WIDTH;
+        const room = width * fillWidth;
         if (measured > room) {
             fontSize = fontSize * (room / measured);
-            ctx.font = `700 ${fontSize}px Archivo, Helvetica, Arial, sans-serif`;
+            ctx.font = `${weight} ${fontSize}px Archivo, Helvetica, Arial, sans-serif`;
         }
-        ctx.globalAlpha = PRESENCE_LABEL_ALPHA;
-        ctx.fillStyle = PRESENCE_LABEL_COLOR;
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = color;
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        ctx.fillText(text, boxLeft + boxWidth / 2, boxTop + boxHeight / 2);
-        ctx.restore();
+        ctx.fillText(text, left + width / 2, top + height / 2);
     }
 
     /** `#rrggbb` as an rgba() string - the gradient stops need a transparent copy of

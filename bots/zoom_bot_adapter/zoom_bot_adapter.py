@@ -230,6 +230,7 @@ class ZoomBotAdapter(BotAdapter):
         # The mark drawn over the avatar, and when it was last changed - the pulse is
         # computed from wall-clock time, so it does not drift with timer jitter.
         self.presence_indicator_state = None
+        self.presence_indicator_tasks = []
         self.presence_indicator_started_at = 0.0
         self.last_image_sent_to_zoom_at = 0.0
         self.recording_is_paused = False
@@ -872,6 +873,7 @@ class ZoomBotAdapter(BotAdapter):
                 self.presence_indicator_state,
                 now - self.presence_indicator_started_at,
                 self.current_image_content_rect,
+                self.presence_indicator_tasks,
             )
             frame = bytes(painted)
         if not presence_indicator.is_animated(self.presence_indicator_state) and self.last_image_sent_to_zoom_at and now - self.last_image_sent_to_zoom_at < 0.5:
@@ -890,15 +892,20 @@ class ZoomBotAdapter(BotAdapter):
 
         return True
 
-    def set_presence_indicator(self, state):
+    def set_presence_indicator(self, state, tasks=()):
         state = presence_indicator.normalize(state)
-        if state == self.presence_indicator_state:
+        tasks = presence_indicator.sanitize_tasks(tasks)
+        if state == self.presence_indicator_state and tasks == self.presence_indicator_tasks:
             return
-        logger.info(f"presence indicator changed from {self.presence_indicator_state} to {state}")
+        # The pulse is timed from a *state* change and not from this call: a progress
+        # note lands every few seconds while an errand runs, and restarting the fade on
+        # each one would make the glow stutter every time the agent said anything.
+        state_changed = state != self.presence_indicator_state
+        if state_changed:
+            logger.info(f"presence indicator changed from {self.presence_indicator_state} to {state}")
+            self.presence_indicator_started_at = time.monotonic()
         self.presence_indicator_state = state
-        # Timed from the change, so every state starts its pulse lit rather than halfway
-        # through a fade somebody else's clock was in the middle of.
-        self.presence_indicator_started_at = time.monotonic()
+        self.presence_indicator_tasks = tasks
         if not presence_indicator.is_animated(state) and self.current_raw_image_to_send:
             # Repaint at once. Zoom holds the last frame it was given, so without this
             # the room would keep looking at whatever the glow was doing when the bot

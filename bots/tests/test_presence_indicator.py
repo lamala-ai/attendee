@@ -230,3 +230,78 @@ class TestTheDefaultAdapterDrawsNothingAndSaysSo(unittest.TestCase):
 
         BotAdapter().set_presence_indicator(presence_indicator.LISTENING)
         BotAdapter().set_presence_indicator(None)
+
+
+class TestTheTaskPills(unittest.TestCase):
+    """What the seat is working on, under the word. Pixels and geometry only."""
+
+    WIDTH, HEIGHT = 320, 180
+
+    def test_a_task_is_drawn_above_the_state_word_and_not_below_it(self):
+        """Fails against a stack that grew downward, which put the newest errand under
+        the meeting client's own name caption - or off the tile entirely."""
+        rows = presence_indicator.task_rows([{"text": "Reading the logs"}])
+        boxes = presence_indicator.task_boxes(self.WIDTH, self.HEIGHT, len(rows))
+        _, label_top, _, _ = presence_indicator.label_box(self.WIDTH, self.HEIGHT)
+        self.assertEqual(len(boxes), 1)
+        _, top, _, height = boxes[0]
+        self.assertLess(top + height, label_top, "a task pill must sit above the word")
+        self.assertGreater(top, 0, "and still inside the picture")
+
+    def test_a_second_errand_stacks_above_the_first_without_moving_it(self):
+        one = presence_indicator.task_boxes(self.WIDTH, self.HEIGHT, 1)
+        two = presence_indicator.task_boxes(self.WIDTH, self.HEIGHT, 2)
+        self.assertEqual(one[0], two[-1], "the row nearest the word should not move")
+        self.assertLess(two[0][1], two[1][1], "and earlier rows stack upward from it")
+
+    def test_a_note_becomes_its_own_line_under_its_task(self):
+        rows = presence_indicator.task_rows([{"text": "Reading the logs", "note": "Two of five"}])
+        self.assertEqual([row[0] for row in rows], ["Reading the logs", "Two of five"])
+        self.assertNotEqual(rows[0][1], rows[1][1], "a note is drawn dimmer than its task")
+
+    def test_a_bare_string_is_a_task_with_no_note(self):
+        self.assertEqual(
+            presence_indicator.sanitize_tasks(["Reading the logs"]),
+            [{"text": "Reading the logs", "note": ""}],
+        )
+
+    def test_more_tasks_than_the_tile_holds_are_dropped_rather_than_shrunk(self):
+        tasks = [f"Errand {index}" for index in range(10)]
+        kept = presence_indicator.sanitize_tasks(tasks)
+        self.assertEqual(len(kept), presence_indicator.TASK_LIMIT)
+        self.assertEqual(kept[0]["text"], "Errand 0")
+
+    def test_a_long_line_is_cut_with_an_ascii_ellipsis(self):
+        """Not the '…' character: both typesetters draw this, and OpenCV's Hershey
+        fonts have no glyph for it - a real ellipsis arrives on the tile as '?'."""
+        clipped = presence_indicator.clip_line("x" * 200)
+        self.assertLessEqual(len(clipped), presence_indicator.TASK_TEXT_LIMIT)
+        self.assertTrue(clipped.endswith("..."))
+        self.assertTrue(clipped.isascii())
+
+    def test_an_empty_task_is_dropped_rather_than_drawn_as_a_blank_pill(self):
+        self.assertEqual(presence_indicator.sanitize_tasks(["", "   ", {"text": ""}]), [])
+
+    def test_tasks_put_ink_on_the_tile_that_the_state_alone_does_not(self):
+        without = blank_i420(self.WIDTH, self.HEIGHT)
+        presence_indicator.paint_i420(without, self.WIDTH, self.HEIGHT, presence_indicator.WORKING, 0.0)
+        with_tasks = blank_i420(self.WIDTH, self.HEIGHT)
+        presence_indicator.paint_i420(
+            with_tasks,
+            self.WIDTH,
+            self.HEIGHT,
+            presence_indicator.WORKING,
+            0.0,
+            None,
+            [{"text": "Reading the logs", "note": "Two of five"}],
+        )
+        self.assertNotEqual(bytes(without), bytes(with_tasks))
+
+    def test_a_state_that_draws_nothing_draws_nothing_even_when_handed_tasks(self):
+        """'off' means the tile is the customer's picture and nothing of ours."""
+        frame = blank_i420(self.WIDTH, self.HEIGHT)
+        untouched = bytes(frame)
+        presence_indicator.paint_i420(
+            frame, self.WIDTH, self.HEIGHT, presence_indicator.OFF, 0.0, None, ["Reading the logs"]
+        )
+        self.assertEqual(bytes(frame), untouched)

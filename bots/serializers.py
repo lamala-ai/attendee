@@ -1999,9 +1999,46 @@ class PatchBotVoiceAgentSettingsSerializer(serializers.Serializer):
 class PatchBotPresenceIndicatorSerializer(serializers.Serializer):
     """Serializer for updating the mark the bot draws over its avatar."""
 
+    class PresenceIndicatorTaskField(serializers.Field):
+        """One task pill: a plain string, or an object with 'text' and optional 'note'.
+
+        Both shapes rather than one because the two callers are different: something
+        reporting "Reading the logs" has nothing to add about progress, and forcing it
+        to wrap that in an object buys nobody anything. Normalised to the object form
+        here so only one shape is ever stored.
+        """
+
+        def to_internal_value(self, data):
+            if isinstance(data, str):
+                data = {"text": data}
+            if not isinstance(data, dict):
+                raise serializers.ValidationError("A task must be a string or an object with 'text'.")
+            text = data.get("text")
+            note = data.get("note")
+            if not isinstance(text, str) or not text.strip():
+                raise serializers.ValidationError("A task needs a non-empty 'text'.")
+            if note is not None and not isinstance(note, str):
+                raise serializers.ValidationError("A task's 'note' must be a string.")
+            # Clipped on the way in, not only on the way to the tile: what the API
+            # accepted and what the room can read should be the same thing, and a
+            # caller reading the bot back should see what it is actually drawing.
+            task = {"text": presence_indicator.clip_line(text)}
+            if note and presence_indicator.clip_line(note):
+                task["note"] = presence_indicator.clip_line(note)
+            return task
+
+        def to_representation(self, value):
+            return value
+
     state = serializers.ChoiceField(
         choices=presence_indicator.STATES,
         help_text=("What the bot should show on its own video tile. 'listening' pulses slowly, 'working' pulses faster, and 'speaking' and 'off' show nothing at all. Costs one call per change: the bot animates the frames it is already sending."),
+    )
+    tasks = serializers.ListField(
+        child=PresenceIndicatorTaskField(),
+        required=False,
+        default=list,
+        help_text=(f"What the bot is working on, drawn as small pills above the state word - one per task, at most {presence_indicator.TASK_LIMIT}, each a few words. Either a plain string or an object with 'text' and an optional 'note' carrying the latest progress on it. Longer text is clipped to fit a video tile. Send an empty list to clear them."),
     )
 
 

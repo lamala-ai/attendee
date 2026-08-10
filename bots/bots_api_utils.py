@@ -368,7 +368,14 @@ def patch_bot_presence_indicator(bot: Bot, data: dict) -> tuple[Bot | None, dict
         return None, serializer.errors
 
     try:
-        bot.settings["presence_indicator"] = {"state": serializer.validated_data["state"]}
+        bot.settings["presence_indicator"] = {
+            "state": serializer.validated_data["state"],
+            # Written on every patch, including when it was not sent: the field defaults
+            # to empty, so a caller that stops sending tasks clears them. A sticky list
+            # would leave the tile naming an errand that finished ten minutes ago, which
+            # is worse than naming none.
+            "tasks": serializer.validated_data["tasks"],
+        }
         bot.save()
     except RecordModifiedError:
         return None, {"error": "Version conflict. Please try again."}

@@ -115,6 +115,39 @@ LABEL_RGB = (0xF7, 0xF8, 0xF8)
 LABEL_ALPHA = 0.96
 LABEL_FONT = cv2.FONT_HERSHEY_DUPLEX
 
+# --- what it is working on, under the word ----------------------------------
+#
+# The state word says whether anybody is home; these say what is being done. One pill
+# per errand the seat is holding, stacked upward from the word so the bottom of the
+# tile stays clear of the meeting client's own name caption.
+#
+# **These break the one-word rule on purpose, and pay for it.** The comment on LABELS
+# above is right that a phrase at thumbnail size becomes a grey smear - so a task pill
+# is not competing with the word. It is narrower in its type, dimmer in its plate and
+# explicitly second-tier: somebody glancing at a gallery view reads WORKING and nothing
+# else, and somebody who has pinned the tile, or is looking at a two-person call where
+# it is half the screen, reads what the errand is. The failure mode of getting this
+# wrong is a smear under the word, which costs the tile nothing it had before.
+TASK_LIMIT = 3
+# Two lines per errand: what was asked, and the agent's own latest word on it. The
+# second is what makes the tile look alive rather than stuck - it changes every time the
+# agent checks in, which is far more often than an errand opens or closes.
+TASK_TEXT_LIMIT = 34
+TASK_WIDTH = 0.62
+TASK_HEIGHT = 0.062
+TASK_GAP = 0.014
+TASK_FILL_WIDTH = 0.90
+TASK_FILL_HEIGHT = 0.40
+# Dimmer than the word's own plate, and the type dimmer still: the stack has to read as
+# hanging off the word rather than as three more words of equal weight.
+TASK_PLATE_ALPHA = 0.50
+TASK_RGB = (0xE8, 0xE6, 0xDE)
+TASK_ALPHA = 0.88
+# The note under a task, dimmer again. Same plate, so a task and its note read as one
+# object rather than as two errands.
+TASK_NOTE_RGB = (0xB9, 0xB3, 0xA4)
+TASK_NOTE_ALPHA = 0.86
+
 
 def is_animated(state):
     """Whether this state pulses - which is what decides how often a tile is redrawn."""
@@ -157,6 +190,79 @@ def label_box(content_width, content_height):
     return int(round(left)), int(round(top)), int(round(width)), int(round(height))
 
 
+def clip_line(text):
+    """One line of tile-sized text: whitespace collapsed, and cut to something that fits.
+
+    Cut with an ASCII ellipsis rather than the character, because both typesetters here
+    are drawing this and OpenCV's Hershey fonts have no glyph for it - a real ellipsis
+    arrives on the Zoom tile as a question mark.
+    """
+    text = " ".join(str(text or "").split())
+    if len(text) <= TASK_TEXT_LIMIT:
+        return text
+    return text[: max(1, TASK_TEXT_LIMIT - 3)].rstrip(" ,;:.-") + "..."
+
+
+def sanitize_tasks(tasks):
+    """The task pills as the tile will draw them: at most TASK_LIMIT, each text + note.
+
+    Accepts a bare string as well as ``{"text": ..., "note": ...}`` so a caller with
+    nothing to say about progress does not have to say it in a dict. Anything that
+    clips to nothing is dropped rather than drawn as an empty pill.
+    """
+    cleaned = []
+    for task in tasks or []:
+        if isinstance(task, dict):
+            text, note = task.get("text"), task.get("note")
+        else:
+            text, note = task, None
+        text = clip_line(text)
+        if not text:
+            continue
+        cleaned.append({"text": text, "note": clip_line(note)})
+        if len(cleaned) >= TASK_LIMIT:
+            break
+    return cleaned
+
+
+def task_rows(tasks):
+    """The task pills flattened to the lines that get drawn, each with its own ink.
+
+    A note is its own line under its task rather than part of it: one long pill at this
+    size is the smear the module docstring warns about, and two short ones are not.
+    """
+    rows = []
+    for task in sanitize_tasks(tasks):
+        rows.append((task["text"], TASK_RGB, TASK_ALPHA))
+        if task["note"]:
+            rows.append((task["note"], TASK_NOTE_RGB, TASK_NOTE_ALPHA))
+    return rows
+
+
+def task_boxes(content_width, content_height, rows):
+    """Where each task line sits, stacked upward from just above the state's own plate.
+
+    Upward because the bottom of a tile belongs to the meeting client, which writes the
+    participant's name there. Growing downward would put the newest errand under the
+    client's caption, or off the tile entirely.
+    """
+    side = min(content_width, content_height)
+    _, label_top, _, _ = label_box(content_width, content_height)
+    width = side * TASK_WIDTH
+    height = side * TASK_HEIGHT
+    gap = side * TASK_GAP
+    left = (content_width - width) / 2.0
+    boxes = []
+    for index in range(rows):
+        # The last row sits directly above the word, and earlier rows stack up from it,
+        # so adding a second errand never moves the first away from the word it hangs on.
+        bottom = label_top - gap - (rows - 1 - index) * (height + gap)
+        boxes.append(
+            (int(round(left)), int(round(bottom - height)), int(round(width)), int(round(height)))
+        )
+    return boxes
+
+
 def _rgb_to_yuv(rgb):
     red, green, blue = rgb
     return (
@@ -189,8 +295,8 @@ def _ring_mask(width, height):
     return np.clip(core + bloom * RING_BLOOM_ALPHA, 0.0, 1.0)
 
 
-@lru_cache(maxsize=16)
-def _label_masks(text, width, height):
+@lru_cache(maxsize=48)
+def _label_masks(text, width, height, fill_width=LABEL_FILL_WIDTH, fill_height=LABEL_FILL_HEIGHT):
     """The plate and the glyphs at this size, as two 0..1 masks over the same box.
 
     Two rather than one because they are different colours, and one because they are
@@ -212,8 +318,8 @@ def _label_masks(text, width, height):
     (base_width, base_height), _ = cv2.getTextSize(text, LABEL_FONT, 1.0, 1)
     if base_width > 0 and base_height > 0:
         scale = min(
-            width * LABEL_FILL_WIDTH / base_width,
-            height * LABEL_FILL_HEIGHT / base_height,
+            width * fill_width / base_width,
+            height * fill_height / base_height,
         )
         thickness = max(1, int(round(height * 0.055)))
         (text_width, text_height), _ = cv2.getTextSize(text, LABEL_FONT, scale, thickness)
@@ -252,15 +358,17 @@ def _halve(mask):
     return cv2.resize(mask, (max(1, width // 2), max(1, height // 2)), interpolation=cv2.INTER_AREA)
 
 
-def paint_i420(frame, width, height, state, elapsed_seconds, content_rect=None):
-    """Draw the glow and the label into an I420 frame, in place.
+def paint_i420(frame, width, height, state, elapsed_seconds, content_rect=None, tasks=()):
+    """Draw the glow, the label and the task pills into an I420 frame, in place.
 
     ``frame`` is a writable buffer holding a full I420 image (Y plane, then half-sized
     U and V planes). ``content_rect`` is where the avatar actually is inside the frame -
     scaling a square portrait into a 16:9 video capability letterboxes it, and a glow
     drawn on the frame would ring the black bars instead of the picture.
 
-    A state that draws nothing returns without touching the buffer.
+    A state that draws nothing returns without touching the buffer - including when it
+    was handed tasks, because ``off`` means the tile is the customer's picture and
+    nothing of ours.
     """
     if not draws(state):
         return
@@ -305,6 +413,19 @@ def paint_i420(frame, width, height, state, elapsed_seconds, content_rect=None):
         plate, glyphs = _label_masks(LABELS[state], box_width, box_height)
         paint(plate, PLATE_RGB, PLATE_ALPHA, x + left, y + top)
         paint(glyphs, LABEL_RGB, LABEL_ALPHA, x + left, y + top)
+
+    rows = task_rows(tasks)
+    for (text, rgb, alpha), (left, top, box_width, box_height) in zip(
+        rows, task_boxes(content_width, content_height, len(rows))
+    ):
+        # A stack tall enough to run off the top of the picture is drawn as far as it
+        # fits and no further: the rows nearest the word are the ones that survive,
+        # which is the right end to keep - TASK_LIMIT bounds this long before it bites.
+        if box_width <= 1 or box_height <= 1 or top < 0:
+            continue
+        plate, glyphs = _label_masks(text, box_width, box_height, TASK_FILL_WIDTH, TASK_FILL_HEIGHT)
+        paint(plate, PLATE_RGB, TASK_PLATE_ALPHA, x + left, y + top)
+        paint(glyphs, rgb, alpha, x + left, y + top)
 
 
 def letterboxed_content_rect(original_size, frame_size):
