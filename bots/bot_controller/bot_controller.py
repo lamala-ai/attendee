@@ -1298,8 +1298,9 @@ class BotController:
 
     def take_action_based_on_presence_indicator_in_db(self):
         state = self.bot_in_db.presence_indicator_state()
+        tasks = self.bot_in_db.presence_indicator_tasks()
         try:
-            self.adapter.set_presence_indicator(state)
+            self.adapter.set_presence_indicator(state, tasks)
         except Exception as e:
             # Cosmetic by definition: a bot that cannot draw a dot is still in the meeting.
             logger.warning(f"Error setting presence indicator to {state}: {e}")

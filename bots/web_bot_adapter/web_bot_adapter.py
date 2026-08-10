@@ -17,6 +17,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from websockets.sync.server import serve
 
+from bots import presence_indicator
 from bots.automatic_leave_configuration import AutomaticLeaveConfiguration
 from bots.automatic_leave_utils import participant_is_another_bot
 from bots.bot_adapter import BotAdapter
@@ -1086,10 +1087,14 @@ class WebBotAdapter(BotAdapter):
             list(image_bytes),
         )
 
-    def set_presence_indicator(self, state):
+    def set_presence_indicator(self, state, tasks=()):
         # Drawn by the page rather than pushed as frames: the canvas is already captured
         # as the bot's video track, so a pulse costs nothing but this one call.
-        self.driver.execute_script("window.botOutputManager.setPresenceIndicator(arguments[0]);", state)
+        self.driver.execute_script(
+            "window.botOutputManager.setPresenceIndicator(arguments[0], arguments[1]);",
+            state,
+            presence_indicator.sanitize_tasks(tasks),
+        )
 
     def send_raw_audio(self, bytes, sample_rate):
         """

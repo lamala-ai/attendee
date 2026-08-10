@@ -1088,6 +1088,15 @@ class Bot(models.Model):
         presence_indicator_settings = self.settings.get("presence_indicator", {}) or {}
         return presence_indicator_settings.get("state", None)
 
+    def presence_indicator_tasks(self):
+        """What the bot should say it is working on, under that word.
+
+        A list, possibly empty - a bot set before this field existed has no key here,
+        and an empty stack is the ordinary case anyway.
+        """
+        presence_indicator_settings = self.settings.get("presence_indicator", {}) or {}
+        return presence_indicator_settings.get("tasks", []) or []
+
     def zoom_tokens_callback_url(self):
         callback_settings = self.settings.get("callback_settings", {})
         if callback_settings is None:

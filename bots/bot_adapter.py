@@ -65,10 +65,10 @@ class BotAdapter:
         """
         pass
 
-    def set_presence_indicator(self, state):
+    def set_presence_indicator(self, state, tasks=()):
         """Say what the bot is doing on its own tile - see bots/presence_indicator.py.
 
         A no-op by default: on an adapter with no video output of its own there is
         nothing to draw on, and a cosmetic mark is never worth failing a call over.
         """
-        logger.info(f"set_presence_indicator called with state = {state}, which this adapter does not draw")
+        logger.info(f"set_presence_indicator called with state = {state} and {len(tasks or [])} task(s), which this adapter does not draw")
