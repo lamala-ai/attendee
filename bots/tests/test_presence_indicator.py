@@ -1,4 +1,6 @@
+import re
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -305,3 +307,23 @@ class TestTheTaskPills(unittest.TestCase):
             frame, self.WIDTH, self.HEIGHT, presence_indicator.OFF, 0.0, None, ["Reading the logs"]
         )
         self.assertEqual(bytes(frame), untouched)
+
+
+class TestTheBrowserSideForwardsWhatItWasGiven(unittest.TestCase):
+    """The canvas is drawn by JavaScript with no test runner of its own, so the one
+    thing worth pinning statically is the seam a Python change cannot see."""
+
+    PAYLOAD = Path(__file__).resolve().parent.parent / "web_bot_adapter" / "shared_chromedriver_payload.js"
+
+    def test_every_presence_entry_point_takes_the_tasks_as_well_as_the_state(self):
+        """Fails against the shipped bug. `botOutputManager.setPresenceIndicator` is a
+        one-line delegator onto the video stream's method of the same name; it kept the
+        old one-argument signature, so `tasks` was dropped on the floor between the
+        adapter and the canvas. The glow and the word still drew - they ride `state` -
+        and the pills silently never did, which is the worst shape a bug can have."""
+        source = self.PAYLOAD.read_text()
+        signatures = re.findall(r"setPresenceIndicator\(([^)]*)\)", source)
+        self.assertGreaterEqual(len(signatures), 3, "expected the definitions and the delegating call")
+        for signature in signatures:
+            self.assertIn("state", signature)
+            self.assertIn("tasks", signature, f"`setPresenceIndicator({signature})` drops the tasks")

@@ -949,8 +949,8 @@ class BotOutputManager {
         return this.webcamVideoOutputStream.displayImage(imageBytes);
     }
 
-    setPresenceIndicator(state) {
-        return this.webcamVideoOutputStream.setPresenceIndicator(state);
+    setPresenceIndicator(state, tasks) {
+        return this.webcamVideoOutputStream.setPresenceIndicator(state, tasks);
     }
 
     isVideoPlaying() {
