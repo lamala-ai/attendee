@@ -275,9 +275,7 @@ def task_boxes(content_width, content_height, rows):
     boxes = []
     for index in range(rows):
         top = below_the_word + gap + index * (height + gap)
-        boxes.append(
-            (int(round(left)), int(round(top)), int(round(width)), int(round(height)))
-        )
+        boxes.append((int(round(left)), int(round(top)), int(round(width)), int(round(height))))
     return boxes
 
 
@@ -434,9 +432,7 @@ def paint_i420(frame, width, height, state, elapsed_seconds, content_rect=None, 
         paint(plate, PLATE_RGB, PLATE_ALPHA, x + left, y + top)
         paint(glyphs, LABEL_RGB, LABEL_ALPHA, x + left, y + top)
 
-    for (text, rgb, alpha), (left, top, box_width, box_height) in zip(
-        rows, task_boxes(content_width, content_height, len(rows))
-    ):
+    for (text, rgb, alpha), (left, top, box_width, box_height) in zip(rows, task_boxes(content_width, content_height, len(rows))):
         # A stack tall enough to run off the picture is drawn as far as it fits and no
         # further. TASK_LIMIT bounds this long before it bites on a square avatar; it
         # can still bite on a letterboxed 16:9 frame, where the picture is short.

@@ -278,9 +278,7 @@ class TestTheTaskPills(unittest.TestCase):
     def test_a_state_that_does_not_name_errands_draws_the_same_tile_with_or_without_them(self):
         for state in (presence_indicator.LISTENING, presence_indicator.SPEAKING):
             with_tasks = blank_i420(self.WIDTH, self.HEIGHT)
-            presence_indicator.paint_i420(
-                with_tasks, self.WIDTH, self.HEIGHT, state, 0.0, None, [{"text": "Reading the logs"}]
-            )
+            presence_indicator.paint_i420(with_tasks, self.WIDTH, self.HEIGHT, state, 0.0, None, [{"text": "Reading the logs"}])
             without = blank_i420(self.WIDTH, self.HEIGHT)
             presence_indicator.paint_i420(without, self.WIDTH, self.HEIGHT, state, 0.0)
             self.assertEqual(bytes(with_tasks), bytes(without), f"{state} should draw no pills")
@@ -332,9 +330,7 @@ class TestTheTaskPills(unittest.TestCase):
         """'off' means the tile is the customer's picture and nothing of ours."""
         frame = blank_i420(self.WIDTH, self.HEIGHT)
         untouched = bytes(frame)
-        presence_indicator.paint_i420(
-            frame, self.WIDTH, self.HEIGHT, presence_indicator.OFF, 0.0, None, ["Reading the logs"]
-        )
+        presence_indicator.paint_i420(frame, self.WIDTH, self.HEIGHT, presence_indicator.OFF, 0.0, None, ["Reading the logs"])
         self.assertEqual(bytes(frame), untouched)
 
 
