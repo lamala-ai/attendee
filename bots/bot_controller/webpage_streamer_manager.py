@@ -179,8 +179,29 @@ class WebpageStreamerManager:
         self.webrtc_connection_started = False
         self.start_or_update_webrtc_connection(url)
 
+    # How many keepalives in a row may fail before a streamer that has never answered is
+    # written off. At one second apart while waiting for a first answer, this is about a
+    # minute - longer than a healthy streamer takes to bring up Xvfb, Chrome and its own
+    # HTTP server, and short enough that a bot does not spend a whole meeting asking.
+    MAX_CONSECUTIVE_KEEPALIVE_FAILURES_BEFORE_GIVING_UP = 60
+
     def send_webpage_streamer_keepalive_periodically(self):
-        """Send keepalive requests to the streaming service periodically."""
+        """Send keepalive requests to the streaming service periodically.
+
+        Gives up on a streamer that never came up. The loop polls once a second until it
+        gets its first answer, which is right while something is still starting and wrong
+        once it is clear nothing will: when this bot's streamer subprocess died on
+        startup - a virtual display it could not get, a Chrome that would not start -
+        every one of those attempts is refused, for the whole length of the meeting, at
+        two log lines a second. One measured deployment spent its logs almost entirely on
+        this, with thirteen dead streamers being asked at once by bots that had long
+        since moved on.
+
+        A bot without a streamer has lost its screenshare, not its meeting, and that is
+        already how the rest of this class behaves - so writing the streamer off is the
+        same outcome, minus the noise and the wasted wakeups.
+        """
+        consecutive_failures = 0
         while not self.cleaned_up:
             try:
                 if not self.webpage_streamer_connection_can_start:
@@ -197,6 +218,7 @@ class WebpageStreamerManager:
                 # call for ever. That is indistinguishable from a healthy quiet loop:
                 # no keepalive line, no error line, and a share that never starts.
                 response = requests.post(f"{self.base_url()}/keepalive", json={}, timeout=10)
+                consecutive_failures = 0
                 logger.info(f"Webpage streamer keepalive response: {response.status_code}")
                 if response.status_code == 200 and not self.webpage_streamer_connection_can_start:
                     bot_is_ready_for_webpage_streamer = self.is_bot_ready_for_webpage_streamer_callback()
@@ -208,8 +230,15 @@ class WebpageStreamerManager:
                         logger.info("Webpage streamer has started but bot is not ready for webpage streamer. Not notifying bot controller.")
 
             except Exception as e:
+                consecutive_failures += 1
                 logger.info(f"Failed to send webpage streamer keepalive: {e}")
-                # Continue the loop even if a single keepalive fails
+                # Continue the loop even if a single keepalive fails - but not for ever
+                # against a streamer that has never once answered. One that answered
+                # before and is failing now may yet come back (restart_stream rebuilds
+                # it), so only a streamer with no answers to its name is written off.
+                if not self.webpage_streamer_connection_can_start and consecutive_failures >= self.MAX_CONSECUTIVE_KEEPALIVE_FAILURES_BEFORE_GIVING_UP:
+                    logger.warning(f"Giving up on the webpage streamer at {self.base_url()} after {consecutive_failures} keepalives with no answer; this bot has no screenshare")
+                    break
 
         logger.info("Webpage streamer keepalive task stopped")
 

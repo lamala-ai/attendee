@@ -5,6 +5,8 @@ import hashlib
 import json
 import logging
 import os
+import shutil
+import tempfile
 import threading
 import time
 from time import sleep
@@ -25,6 +27,7 @@ from bots.models import ParticipantEventTypes, RecordingViews
 from bots.per_participant_realtime_video_configuration import PerParticipantRealtimeVideoConfiguration
 from bots.utils import half_ceil, scale_i420
 
+from . import chrome_policies
 from .debug_screen_recorder import DebugScreenRecorder
 from .ui_methods import UiAuthorizedUserNotInMeetingTimeoutExceededException, UiBlockedByCaptchaException, UiCouldNotJoinMeetingWaitingForHostException, UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiIncorrectPasswordException, UiInfinitelyRetryableException, UiLoginAttemptFailedException, UiLoginRequiredException, UiMeetingNotFoundException, UiRequestToJoinDeniedException, UiRetryableException, UiRetryableExpectedException
 
@@ -83,6 +86,8 @@ class WebBotAdapter(BotAdapter):
         self.video_frame_size = video_frame_size
 
         self.driver = None
+        # The directory `self.driver`'s Chrome keeps its profile in - see init_driver().
+        self.chrome_profile_dir = None
 
         self.send_frames = True
 
@@ -588,15 +593,24 @@ class WebBotAdapter(BotAdapter):
     def subclass_specific_chrome_policies(self):
         return {}
 
-    def write_chrome_policies_file(self):
-        # Check if the /etc/.../attendee-chrome-policies.json symlink exists. If not, skip this, we are not running in the docker container.
-        if not os.path.islink("/etc/opt/chrome/policies/managed/attendee-chrome-policies.json"):
-            logger.warning("Attendee chrome policy file symlink does not exist, skipping writing chrome policies.")
+    def discard_chrome_profile_dir(self):
+        """Remove the profile directory of a Chrome that has been quit.
+
+        A bot's browser is launched more than once - `repeatedly_attempt_to_join_meeting`
+        gets three tries - and each launch mints a directory. Left behind, that is a leak
+        of exactly the kind the streamer's own profile handling calls out: slow, invisible
+        and eventually the whole container's problem.
+        """
+        profile_dir, self.chrome_profile_dir = self.chrome_profile_dir, None
+        if not profile_dir:
             return
-        policy = self.subclass_specific_chrome_policies()
-        with open("/tmp/attendee-chrome-policies.json", "w") as f:
-            json.dump(policy, f, indent=2)
-        logger.info("Chrome policy file written to /tmp/attendee-chrome-policies.json: %s", policy)
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+    def write_chrome_policies_file(self):
+        # There is one managed-policy file for the whole container and, off Kubernetes,
+        # many bots in it - so this registers what this bot wants rather than writing
+        # over what the others are already running under. See chrome_policies.py.
+        chrome_policies.claim(self.subclass_specific_chrome_policies())
 
     def add_subclass_specific_chrome_options(self, options):
         pass
@@ -651,6 +665,25 @@ class WebBotAdapter(BotAdapter):
             except Exception as e:
                 logger.warning(f"Error closing existing driver: {e}")
             self.driver = None
+            self.discard_chrome_profile_dir()
+
+        # A profile directory of this browser's own, minted per launch.
+        #
+        # Chrome refuses to start a second browser against a profile another one is
+        # holding - "session not created: probably user data directory is already in
+        # use" - and off Kubernetes every bot in a deployment is a celery task inside
+        # one container, sharing one HOME and one /tmp with all the others. Whatever
+        # profile directory two of them end up agreeing on, the second bot to start
+        # never gets a browser, and a bot without a browser never joins its meeting.
+        # A retry inside one bot has the same problem against its own previous Chrome
+        # if that one is wedged rather than gone, which is why this is minted here
+        # rather than once per adapter.
+        #
+        # The per-bot webpage streamer already does this for exactly this reason
+        # (webpage_streamer.py `_start_browser`); this is the same fix for the browser
+        # that actually joins the meeting.
+        self.chrome_profile_dir = tempfile.mkdtemp(prefix="attendee-bot-profile-")
+        options.add_argument(f"--user-data-dir={self.chrome_profile_dir}")
 
         self.driver = webdriver.Chrome(options=options, service=Service(executable_path="/usr/local/bin/chromedriver"))
         logger.info(f"web driver server initialized at port {self.driver.service.port}")
@@ -939,6 +972,15 @@ class WebBotAdapter(BotAdapter):
                     logger.warning(f"Error quitting driver: {e}")
         except Exception as e:
             logger.warning(f"Error during cleanup: {e}")
+
+        # Both outside the try above: whatever went wrong with the browser, the disk it
+        # was using and the policy claim it was holding are this bot's to give back, and
+        # a container full of bots is where not giving them back is felt.
+        self.discard_chrome_profile_dir()
+        try:
+            chrome_policies.withdraw()
+        except Exception as e:
+            logger.warning(f"Error withdrawing this bot's Chrome policy claim: {e}")
 
         if self.debug_screen_recorder:
             self.debug_screen_recorder.stop()

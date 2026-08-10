@@ -101,6 +101,7 @@ class TestCleanupLocalWebpageStreamerProcess(SimpleTestCase):
     def test_signals_the_process_group_and_waits(self):
         controller = make_controller()
         process = MagicMock(pid=1234)
+        process.poll.return_value = None  # still running
         process.wait.return_value = 0
         controller._local_webpage_streamer_process = process
 
@@ -115,6 +116,7 @@ class TestCleanupLocalWebpageStreamerProcess(SimpleTestCase):
     def test_escalates_to_sigkill_when_sigterm_does_not_land(self):
         controller = make_controller()
         process = MagicMock(pid=1234)
+        process.poll.return_value = None  # still running
         process.wait.side_effect = [subprocess.TimeoutExpired(cmd="run_webpage_streamer.py", timeout=10), 0]
         controller._local_webpage_streamer_process = process
 
@@ -129,6 +131,7 @@ class TestCleanupLocalWebpageStreamerProcess(SimpleTestCase):
         pid nobody holds any more is the normal shape of that, not an error to surface."""
         controller = make_controller()
         process = MagicMock(pid=1234)
+        process.poll.return_value = None  # still running as far as Popen knows
         controller._local_webpage_streamer_process = process
 
         with patch("bots.bot_controller.bot_controller.os.getpgid", side_effect=ProcessLookupError()):
@@ -136,11 +139,34 @@ class TestCleanupLocalWebpageStreamerProcess(SimpleTestCase):
 
         self.assertIsNone(controller._local_webpage_streamer_process)
 
+    def test_a_process_that_already_exited_is_never_signalled_by_pid(self):
+        """The one that matters most, because of what it prevents rather than what it
+        does. A PID whose process has exited and been reaped names nothing - and the
+        kernel reissues PIDs, so tomorrow it names something else. os.getpgid() on a
+        reissued PID answers with a process group belonging to a stranger, and this
+        method's entire job is to SIGTERM a process group. In this container the likeliest
+        stranger is the celery worker running every other meeting in it.
+
+        Against the old behaviour, which went straight to getpgid(process.pid), the two
+        calls below both happened."""
+        controller = make_controller()
+        process = MagicMock(pid=99)
+        process.poll.return_value = 0  # exited and reaped
+        controller._local_webpage_streamer_process = process
+
+        with patch("bots.bot_controller.bot_controller.os.getpgid") as getpgid, patch("bots.bot_controller.bot_controller.os.killpg") as killpg:
+            controller._cleanup_local_webpage_streamer_process()
+
+        getpgid.assert_not_called()
+        killpg.assert_not_called()
+        self.assertIsNone(controller._local_webpage_streamer_process)
+
     def test_cleaning_up_one_bots_process_does_not_touch_another_bots(self):
         """The collision this whole design exists to avoid, checked from the teardown
         side: terminating one bot's streamer must never reach for another bot's handle."""
         controller_a, controller_b = make_controller(1), make_controller(2)
         process_a, process_b = MagicMock(pid=101), MagicMock(pid=102)
+        process_a.poll.return_value = None  # still running
         process_a.wait.return_value = 0
         controller_a._local_webpage_streamer_process = process_a
         controller_b._local_webpage_streamer_process = process_b

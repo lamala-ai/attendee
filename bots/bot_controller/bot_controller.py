@@ -23,6 +23,7 @@ from bots.bot_adapter import BotAdapter
 from bots.bot_controller.bot_websocket_client_manager import BotWebsocketClientManager
 from bots.bot_sso_utils import create_google_meet_sign_in_session
 from bots.bots_api_utils import BotCreationSource
+from bots.container_hygiene import tidy_up_after_departed_bots
 from bots.external_callback_utils import get_zoom_tokens
 from bots.meeting_url_utils import meeting_type_from_url, parse_zoom_registrant_token
 from bots.models import (
@@ -992,6 +993,20 @@ class BotController:
         if process is None:
             return
 
+        # Ask Popen whether the child is still running before going anywhere near its
+        # PID. A process that has already exited and been reaped leaves a handle whose
+        # `.pid` names nothing - and a PID that names nothing today can name something
+        # else tomorrow, because the kernel reissues them. `os.getpgid()` on a reissued
+        # PID answers happily with a process group that has nothing to do with this bot,
+        # and this method's whole job is to signal a process group. In this container the
+        # most likely bystander is the celery worker running every other meeting.
+        #
+        # poll() is the safe question because Popen only reports an exit for a child it
+        # reaped itself, and the kernel cannot reissue a PID before it is reaped.
+        if process.poll() is not None:
+            logger.info(f"Local webpage streamer (pid {process.pid}) has already exited, nothing to terminate")
+            return
+
         logger.info(f"Terminating local webpage streamer (pid {process.pid})...")
         try:
             pgid = os.getpgid(process.pid)
@@ -1014,6 +1029,12 @@ class BotController:
         if self.run_called:
             raise Exception("Run already called, exiting")
         self.run_called = True
+
+        # Before anything of this bot's needs a display or a browser: clear away the
+        # ones bots that died mid-teardown are still nominally holding. Off Kubernetes
+        # they died in this container, and what they left behind is what stops this bot
+        # starting - see bots/container_hygiene.py.
+        tidy_up_after_departed_bots()
 
         self.connect_to_redis()
 
@@ -1107,8 +1128,21 @@ class BotController:
         self._local_webpage_streamer_process = None
         if self.bot_in_db.should_launch_webpage_streamer():
             running_in_kubernetes = os.getenv("LAUNCH_BOT_METHOD") == "kubernetes"
+            # One streamer service for the whole deployment, the arrangement per-bot
+            # streamers replaced. Kept reachable by a variable because "one streamer per
+            # bot" costs a container an Xvfb, a Chrome and a chromedriver per bot on top
+            # of the browser that joins the meeting, and on a deployment where that is
+            # too much the failure is not a lost screenshare - it is bots that cannot
+            # start a browser at all, which is to say meetings nobody joins. Being able
+            # to put a deployment back on the shared streamer without a rollback is the
+            # difference between a capability degrading and a product being down.
+            #
+            # This is the same variable the manager already reads to decide whether
+            # /shutdown is safe to send, so setting it puts every part of the streamer
+            # lifecycle into shared-service semantics at once.
+            using_shared_streamer = os.getenv("WEBPAGE_STREAMER_IS_SHARED", "").strip().lower() in ("1", "true", "yes")
             webpage_streamer_base_url = None
-            if not running_in_kubernetes:
+            if not running_in_kubernetes and not using_shared_streamer:
                 # Kubernetes already gives every bot pod its own streamer pod
                 # (bot_pod_creator.py). Off-Kubernetes - celery workers sharing one
                 # Railway replica - "one per bot" has to mean one OS process on a port
@@ -1116,7 +1150,10 @@ class BotController:
                 # its own rather than reaching for a hostname shared by the fleet.
                 self._local_webpage_streamer_process, webpage_streamer_base_url = self._launch_local_webpage_streamer()
 
-            if running_in_kubernetes or webpage_streamer_base_url:
+            # A shared streamer needs no base url: WebpageStreamerManager.base_url()
+            # falls back to WEBPAGE_STREAMER_HOSTNAME:8000, which is how every bot
+            # reached it before per-bot streamers existed.
+            if running_in_kubernetes or using_shared_streamer or webpage_streamer_base_url:
                 self.webpage_streamer_manager = WebpageStreamerManager(
                     is_bot_ready_for_webpage_streamer_callback=self.adapter.is_bot_ready_for_webpage_streamer,
                     get_peer_connection_offer_callback=self.adapter.webpage_streamer_get_peer_connection_offer,
