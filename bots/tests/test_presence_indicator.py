@@ -237,24 +237,53 @@ class TestTheDefaultAdapterDrawsNothingAndSaysSo(unittest.TestCase):
 class TestTheTaskPills(unittest.TestCase):
     """What the seat is working on, under the word. Pixels and geometry only."""
 
-    WIDTH, HEIGHT = 320, 180
+    # A square picture, which is what an avatar actually is once letterboxing is
+    # accounted for - the stack is sized as a fraction of the shorter side.
+    WIDTH, HEIGHT = 640, 640
 
-    def test_a_task_is_drawn_above_the_state_word_and_not_below_it(self):
-        """Fails against a stack that grew downward, which put the newest errand under
-        the meeting client's own name caption - or off the tile entirely."""
+    def test_a_task_hangs_under_the_state_word(self):
+        """The word is the heading and the pills are what it is about, so a reader who
+        has just read WORKING carries on downward."""
         rows = presence_indicator.task_rows([{"text": "Reading the logs"}])
         boxes = presence_indicator.task_boxes(self.WIDTH, self.HEIGHT, len(rows))
-        _, label_top, _, _ = presence_indicator.label_box(self.WIDTH, self.HEIGHT)
+        left, label_top, _, label_height = presence_indicator.label_box(self.WIDTH, self.HEIGHT, len(rows))
         self.assertEqual(len(boxes), 1)
-        _, top, _, height = boxes[0]
-        self.assertLess(top + height, label_top, "a task pill must sit above the word")
-        self.assertGreater(top, 0, "and still inside the picture")
+        _, top, _, _ = boxes[0]
+        self.assertGreater(top, label_top + label_height, "a task pill hangs under the word")
 
-    def test_a_second_errand_stacks_above_the_first_without_moving_it(self):
-        one = presence_indicator.task_boxes(self.WIDTH, self.HEIGHT, 1)
-        two = presence_indicator.task_boxes(self.WIDTH, self.HEIGHT, 2)
-        self.assertEqual(one[0], two[-1], "the row nearest the word should not move")
-        self.assertLess(two[0][1], two[1][1], "and earlier rows stack upward from it")
+    def test_rows_run_downward_in_the_order_they_were_given(self):
+        boxes = presence_indicator.task_boxes(self.WIDTH, self.HEIGHT, 3)
+        self.assertEqual([box[1] for box in boxes], sorted(box[1] for box in boxes))
+
+    def test_the_word_lifts_so_the_group_keeps_the_caption_clearance(self):
+        """Fails against hanging the pills off a word that stays put, which walks the
+        stack down into the meeting client's own name caption one errand at a time.
+        The inset has to be measured from whatever is actually lowest."""
+        _, bare_top, _, bare_height = presence_indicator.label_box(self.WIDTH, self.HEIGHT, 0)
+        floor = bare_top + bare_height
+        for rows in (1, 2, 3):
+            boxes = presence_indicator.task_boxes(self.WIDTH, self.HEIGHT, rows)
+            bottom = boxes[-1][1] + boxes[-1][3]
+            self.assertLessEqual(abs(bottom - floor), 2, f"{rows} rows should end where the bare word does")
+            _, top, _, _ = presence_indicator.label_box(self.WIDTH, self.HEIGHT, rows)
+            self.assertLess(top, bare_top, "and the word itself lifts to make the room")
+
+    def test_only_working_names_an_errand(self):
+        """Listening is not holding one, and speaking is delivering one the room can
+        already hear - writing that under the word tells them what they are being told."""
+        self.assertTrue(presence_indicator.shows_tasks(presence_indicator.WORKING))
+        self.assertFalse(presence_indicator.shows_tasks(presence_indicator.LISTENING))
+        self.assertFalse(presence_indicator.shows_tasks(presence_indicator.SPEAKING))
+
+    def test_a_state_that_does_not_name_errands_draws_the_same_tile_with_or_without_them(self):
+        for state in (presence_indicator.LISTENING, presence_indicator.SPEAKING):
+            with_tasks = blank_i420(self.WIDTH, self.HEIGHT)
+            presence_indicator.paint_i420(
+                with_tasks, self.WIDTH, self.HEIGHT, state, 0.0, None, [{"text": "Reading the logs"}]
+            )
+            without = blank_i420(self.WIDTH, self.HEIGHT)
+            presence_indicator.paint_i420(without, self.WIDTH, self.HEIGHT, state, 0.0)
+            self.assertEqual(bytes(with_tasks), bytes(without), f"{state} should draw no pills")
 
     def test_a_note_becomes_its_own_line_under_its_task(self):
         rows = presence_indicator.task_rows([{"text": "Reading the logs", "note": "Two of five"}])

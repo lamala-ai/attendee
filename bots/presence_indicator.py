@@ -180,13 +180,31 @@ def pulse(state, elapsed_seconds):
     return 0.5 - 0.5 * math.cos(2 * math.pi * (elapsed_seconds % cycle) / cycle)
 
 
-def label_box(content_width, content_height):
-    """Where the label's plate sits inside a picture of this size, in pixels."""
+def shows_tasks(state):
+    """Whether this state draws the task pills at all.
+
+    Only ``working``. The other two states have nothing to name: ``listening`` is not
+    holding an errand, and ``speaking`` is delivering one - the room can hear what that
+    one is, so writing it under the word is telling them something they are being told.
+    """
+    return state == WORKING
+
+
+def label_box(content_width, content_height, rows=0):
+    """Where the label's plate sits inside a picture of this size, in pixels.
+
+    ``rows`` lifts the word by the height of the task stack that will hang under it, so
+    the *bottom of the whole group* lands where the word's bottom sits when there are no
+    tasks. That inset is the clearance from the meeting client's own name caption, and
+    it has to be measured from whatever is actually lowest - otherwise adding a second
+    errand walks the stack down into the client's chrome one row at a time.
+    """
     side = min(content_width, content_height)
     width = side * LABEL_WIDTH
     height = side * LABEL_HEIGHT
     left = (content_width - width) / 2.0
-    top = content_height - side * LABEL_INSET - height
+    stack = rows * (side * TASK_HEIGHT + side * TASK_GAP)
+    top = content_height - side * LABEL_INSET - height - stack
     return int(round(left)), int(round(top)), int(round(width)), int(round(height))
 
 
@@ -240,25 +258,25 @@ def task_rows(tasks):
 
 
 def task_boxes(content_width, content_height, rows):
-    """Where each task line sits, stacked upward from just above the state's own plate.
+    """Where each task line sits: hanging under the state's own plate, in order.
 
-    Upward because the bottom of a tile belongs to the meeting client, which writes the
-    participant's name there. Growing downward would put the newest errand under the
-    client's caption, or off the tile entirely.
+    Under rather than over, because the word is the heading and these are what it is
+    about - a reader who has just read WORKING carries on downward. The room's own
+    clearance is preserved by lifting the word instead (see ``label_box``), so nothing
+    grows into the meeting client's name caption at the bottom of the tile.
     """
     side = min(content_width, content_height)
-    _, label_top, _, _ = label_box(content_width, content_height)
+    _, label_top, _, label_height = label_box(content_width, content_height, rows)
     width = side * TASK_WIDTH
     height = side * TASK_HEIGHT
     gap = side * TASK_GAP
     left = (content_width - width) / 2.0
+    below_the_word = label_top + label_height
     boxes = []
     for index in range(rows):
-        # The last row sits directly above the word, and earlier rows stack up from it,
-        # so adding a second errand never moves the first away from the word it hangs on.
-        bottom = label_top - gap - (rows - 1 - index) * (height + gap)
+        top = below_the_word + gap + index * (height + gap)
         boxes.append(
-            (int(round(left)), int(round(bottom - height)), int(round(width)), int(round(height)))
+            (int(round(left)), int(round(top)), int(round(width)), int(round(height)))
         )
     return boxes
 
@@ -408,20 +426,21 @@ def paint_i420(frame, width, height, state, elapsed_seconds, content_rect=None, 
             y,
         )
 
-    left, top, box_width, box_height = label_box(content_width, content_height)
+    rows = task_rows(tasks) if shows_tasks(state) else []
+
+    left, top, box_width, box_height = label_box(content_width, content_height, len(rows))
     if box_width > 1 and box_height > 1:
         plate, glyphs = _label_masks(LABELS[state], box_width, box_height)
         paint(plate, PLATE_RGB, PLATE_ALPHA, x + left, y + top)
         paint(glyphs, LABEL_RGB, LABEL_ALPHA, x + left, y + top)
 
-    rows = task_rows(tasks)
     for (text, rgb, alpha), (left, top, box_width, box_height) in zip(
         rows, task_boxes(content_width, content_height, len(rows))
     ):
-        # A stack tall enough to run off the top of the picture is drawn as far as it
-        # fits and no further: the rows nearest the word are the ones that survive,
-        # which is the right end to keep - TASK_LIMIT bounds this long before it bites.
-        if box_width <= 1 or box_height <= 1 or top < 0:
+        # A stack tall enough to run off the picture is drawn as far as it fits and no
+        # further. TASK_LIMIT bounds this long before it bites on a square avatar; it
+        # can still bite on a letterboxed 16:9 frame, where the picture is short.
+        if box_width <= 1 or box_height <= 1 or top < 0 or top + box_height > content_height:
             continue
         plate, glyphs = _label_masks(text, box_width, box_height, TASK_FILL_WIDTH, TASK_FILL_HEIGHT)
         paint(plate, PLATE_RGB, TASK_PLATE_ALPHA, x + left, y + top)
