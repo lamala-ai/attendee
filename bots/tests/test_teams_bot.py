@@ -1,8 +1,10 @@
 import base64
 import json
+import tempfile
 import threading
 import time
-from unittest.mock import MagicMock, mock_open, patch
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from django.db import connection
 from django.test import TransactionTestCase, tag
@@ -12,6 +14,7 @@ from bots.bot_controller.bot_controller import BotController
 from bots.bots_api_views import send_sync_command
 from bots.models import Bot, BotChatMessageRequest, BotChatMessageRequestStates, BotChatMessageToOptions, BotEventManager, BotEventSubTypes, BotEventTypes, BotLogin, BotLoginGroup, BotLoginPlatform, BotMediaRequest, BotMediaRequestMediaTypes, BotMediaRequestStates, BotStates, MediaBlob, Organization, Project, Recording, RecordingStates, RecordingTypes, TranscriptionProviders, TranscriptionTypes
 from bots.teams_bot_adapter.teams_ui_methods import TeamsUIMethods, UiTeamsBlockingUsException, UiWaitingRoomTransitionFailedException
+from bots.web_bot_adapter import chrome_policies
 from bots.web_bot_adapter.ui_methods import UiLoginRequiredException
 
 
@@ -1089,22 +1092,18 @@ class TestTeamsBot(TransactionTestCase):
             # Wait for the bot to join and adapter to be created
             time.sleep(3)
 
-            # --- Verify the Chrome policy file would be written correctly ---
-            # Mock os.path.islink to return True so policy file writing code runs
-            # and mock open() to capture what would be written without touching filesystem
-            m = mock_open()
-            with patch("bots.web_bot_adapter.web_bot_adapter.os.path.islink", return_value=True):
-                with patch("builtins.open", m):
+            # --- Verify the Chrome policy this bot claims ---
+            # There is one managed-policy file for the whole container and, off
+            # Kubernetes, many bots in it - so it is written from what the live bots each
+            # want rather than by whoever started last (bots/web_bot_adapter/chrome_policies.py).
+            # Pointed at a scratch directory here so this asserts the policy a Teams bot
+            # asks for, and not the machine the suite happens to be running on.
+            with tempfile.TemporaryDirectory() as policy_dir:
+                policy_file = Path(policy_dir) / "attendee-chrome-policies.json"
+                with patch.object(chrome_policies, "POLICY_FILE", policy_file), patch.object(chrome_policies, "REGISTRY_FILE", Path(policy_dir) / "registry.json"), patch.object(chrome_policies, "LOCK_FILE", Path(policy_dir) / "lock"), patch.object(chrome_policies, "_is_running_in_the_container", return_value=True):
                     controller.adapter.write_chrome_policies_file()
 
-            # Verify open was called with the correct path
-            m.assert_called_once_with("/tmp/attendee-chrome-policies.json", "w")
-
-            # Get the data that would have been written via json.dump
-            # json.dump calls write() on the file handle, so we get what was written
-            write_calls = m().write.call_args_list
-            written_data = "".join(call[0][0] for call in write_calls)
-            policy = json.loads(written_data)
+                policy = json.loads(policy_file.read_text())
 
             # Verify the BrowserSwitcher policy is correctly configured
             self.assertTrue(policy.get("BrowserSwitcherEnabled"), "BrowserSwitcherEnabled should be True")
