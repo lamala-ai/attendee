@@ -528,10 +528,21 @@ class BotVideoOutputStream {
         // The word, on a plate that keeps it legible over a photograph. Both sit inside
         // the circle inscribed in the picture, because that is what survives a client
         // cropping the tile to fill its own shape.
+        // Only `working` names an errand: `listening` is not holding one, and
+        // `speaking` is delivering one the room can already hear.
+        const rows = this.presenceState === "working" ? this._presenceTaskRows() : [];
+        const taskHeight = side * PRESENCE_TASK_HEIGHT;
+        const gap = side * PRESENCE_TASK_GAP;
+
         const boxWidth = side * PRESENCE_LABEL_WIDTH;
         const boxHeight = side * PRESENCE_LABEL_HEIGHT;
         const boxLeft = offsetX + (width - boxWidth) / 2;
-        const boxTop = offsetY + height - side * PRESENCE_LABEL_INSET - boxHeight;
+        // The word is lifted by the height of the stack hanging under it, so the bottom
+        // of the whole group keeps the inset that clears the meeting client's own name
+        // caption. Measured from whatever is lowest, or a second errand walks the stack
+        // down into the client's chrome one row at a time.
+        const stack = rows.length * (taskHeight + gap);
+        const boxTop = offsetY + height - side * PRESENCE_LABEL_INSET - boxHeight - stack;
         this._drawPresencePill({
             left: boxLeft,
             top: boxTop,
@@ -546,18 +557,14 @@ class BotVideoOutputStream {
             weight: 700,
         });
 
-        // What it is working on, stacked upward from that word. Upward because the
-        // bottom of a tile belongs to the meeting client, which writes the participant's
-        // name there.
-        const rows = this._presenceTaskRows();
+        // What it is working on, hanging under that word in order: the word is the
+        // heading, and a reader who has just read WORKING carries on downward.
         const taskWidth = side * PRESENCE_TASK_WIDTH;
-        const taskHeight = side * PRESENCE_TASK_HEIGHT;
-        const gap = side * PRESENCE_TASK_GAP;
         const taskLeft = offsetX + (width - taskWidth) / 2;
+        const belowTheWord = boxTop + boxHeight;
         rows.forEach((row, index) => {
-            const bottom = boxTop - gap - (rows.length - 1 - index) * (taskHeight + gap);
-            const top = bottom - taskHeight;
-            if (top < offsetY) {
+            const top = belowTheWord + gap + index * (taskHeight + gap);
+            if (top < offsetY || top + taskHeight > offsetY + height) {
                 return;
             }
             this._drawPresencePill({
