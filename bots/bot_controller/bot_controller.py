@@ -23,6 +23,7 @@ from bots.bot_adapter import BotAdapter
 from bots.bot_controller.bot_websocket_client_manager import BotWebsocketClientManager
 from bots.bot_sso_utils import create_google_meet_sign_in_session
 from bots.bots_api_utils import BotCreationSource
+from bots.container_capacity import log_capacity
 from bots.container_hygiene import tidy_up_after_departed_bots
 from bots.external_callback_utils import get_zoom_tokens
 from bots.meeting_url_utils import meeting_type_from_url, parse_zoom_registrant_token
@@ -1035,6 +1036,11 @@ class BotController:
         # they died in this container, and what they left behind is what stops this bot
         # starting - see bots/container_hygiene.py.
         tidy_up_after_departed_bots()
+
+        # And say how much room is left once it has. What runs out here is the container's
+        # task ceiling rather than CPU or memory, and nothing draws that graph - see
+        # bots/container_capacity.py.
+        log_capacity(f"Bot {self.bot_in_db.id} starting")
 
         self.connect_to_redis()
 

@@ -1,6 +1,8 @@
 import logging
 import subprocess
 
+from bots.container_capacity import encoder_thread_args
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,6 +42,7 @@ class DebugScreenRecorder:
             "-an",
             "-c:v",
             "libx264",
+            *encoder_thread_args(),
             "-preset",
             preset,
             "-crf",
