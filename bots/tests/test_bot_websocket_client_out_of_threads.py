@@ -77,6 +77,25 @@ class TestBotWebsocketClientOutOfThreads(unittest.TestCase):
                 self.client.start()
             self.assertEqual(thread_class.return_value.start.call_count, 1, "the failed thread start was retried without waiting")
 
+    def test_a_stopped_client_is_not_resurrected_by_the_rollback(self):
+        """STOPPED outranks the rollback.
+
+        cleanup() does not hold the start lock, so a bot leaving the meeting can stop the
+        client while a start is in flight. Rolling that back to NOT_STARTED would let the
+        next video frame raise a websocket client for a bot no longer in the room.
+        """
+
+        def stop_then_fail():
+            self.client.connection_state = BotWebsocketClient.STOPPED
+            raise RuntimeError("can't start new thread")
+
+        with patch("bots.bot_controller.bot_websocket_client.Thread") as thread_class:
+            thread_class.return_value.start.side_effect = stop_then_fail
+            self.client.start()
+
+        self.assertEqual(self.client.connection_state, BotWebsocketClient.STOPPED)
+        self.assertTrue(self.client.started(), "a stopped client must not look startable again")
+
     def test_worker_threads_that_cannot_start_do_not_leave_the_client_claiming_to_be_connected(self):
         """The other half of the ceiling, and the worse one.
 

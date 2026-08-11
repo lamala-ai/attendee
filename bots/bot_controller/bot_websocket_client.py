@@ -112,7 +112,7 @@ class BotWebsocketClient:
                 # rather than whatever it was before, because there is genuinely nothing
                 # running now - reporting CONNECTED would queue frames into a socket with
                 # no sender behind it.
-                self.connection_state = self.NOT_STARTED
+                self._roll_back_to_not_started()
                 self.connection_thread = None
                 self._no_thread_start_before = time.monotonic() + self._thread_start_retry_delay_s
                 logger.error("BotWebsocketClient could not start its connection thread (%s); retrying in %ss", e, self._thread_start_retry_delay_s)
@@ -175,6 +175,18 @@ class BotWebsocketClient:
         self.connection_state = self.FAILED
         logger.error("BotWebsocketClient failed to establish websocket connection after %d retries", self._max_retries)
 
+    def _roll_back_to_not_started(self):
+        """Make the client startable again after a thread it needed could not start.
+
+        Unless it has been stopped. `cleanup()` does not hold `_start_connection_lock`, so
+        a bot leaving the meeting can set STOPPED while a start is in flight - and STOPPED
+        is the one state that must survive, or a late video frame would raise a websocket
+        client back up for a bot that is no longer in the room.
+        """
+        if self.connection_state == self.STOPPED:
+            return
+        self.connection_state = self.NOT_STARTED
+
     def _release_connection(self, error):
         """Let go of a connection we cannot run, leaving the client able to try again.
 
@@ -183,7 +195,7 @@ class BotWebsocketClient:
         rather than dropped because its reader thread is exactly the resource we have just
         run out of, and abandoning it would hold that thread until the far end gave up.
         """
-        self.connection_state = self.NOT_STARTED
+        self._roll_back_to_not_started()
         self._no_thread_start_before = time.monotonic() + self._thread_start_retry_delay_s
         try:
             if self.websocket:
