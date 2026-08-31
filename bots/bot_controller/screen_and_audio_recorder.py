@@ -5,10 +5,14 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# How much of ffmpeg's own complaint to put in the log when it dies. Its startup errors
-# are one line ("Cannot open audio device", "Invalid argument"); the tail is what says
-# why it stopped, and the banner above it says nothing worth carrying.
-FFMPEG_ERROR_TAIL_CHARS = 2000
+# How much of FFmpeg's own complaint to put in the log when it dies. Its startup errors
+# are a line or two ("Cannot open audio device", "Invalid argument"), and what carries
+# them has a line length of its own: the first attempt logged a 2000-character tail and
+# the hosting platform truncated it, so what survived was build flags and the error was
+# the part that got cut. Last few lines, tightly capped, and the banner is turned off at
+# the source.
+FFMPEG_ERROR_TAIL_LINES = 6
+FFMPEG_ERROR_TAIL_CHARS = 600
 
 
 class ScreenAndAudioRecorder:
@@ -24,6 +28,11 @@ class ScreenAndAudioRecorder:
         self.ffmpeg_log_location = f"{file_location}.ffmpeg.log" if file_location else None
         self.ffmpeg_log_file = None
         self.ffmpeg_command = None
+        # Whether the FFmpeg now running was asked for audio. False once the fallback
+        # below has run, so a recorder that has already given up its sound is not
+        # restarted again every time the main loop comes round.
+        self.recording_with_audio = False
+        self.display_var = None
         # Screen will have buffer, we will crop to the recording dimensions
         self.screen_dimensions = (recording_dimensions[0] + 10, recording_dimensions[1] + 10)
         self.recording_dimensions = recording_dimensions
@@ -37,11 +46,47 @@ class ScreenAndAudioRecorder:
     def start_recording(self, display_var):
         logger.info(f"Starting screen recorder for display {display_var} with dimensions {self.screen_dimensions} and file location {self.file_location}")
 
+        self.display_var = display_var
+        self._start_ffmpeg(display_var, with_audio=True)
+
+    def restart_without_audio_if_ffmpeg_died(self):
+        """Recover a recording that an unopenable audio device killed at birth.
+
+        A screen recording that has to have sound is not a screen recording. FFmpeg
+        takes both inputs in one process, so an ALSA device that will not open takes the
+        *video* down with it and the meeting is left with no file at all - which is what
+        was happening on every call here, invisibly, because the audio branch is the
+        fragile half (see webpage_streamer, which has carried a no-sound-card path for
+        exactly this reason) and nothing ever checked whether FFmpeg was still alive.
+
+        Asked from the main loop rather than waited for at startup, and that is not a
+        detail: the caller takes `media_sending_enable_timestamp_ms` the instant this
+        returns, that timestamp becomes the recording's `first_buffer_timestamp_ms`, and
+        every utterance is aligned against it. Blocking here to watch FFmpeg die would
+        have shifted the whole transcript by however long we waited, on every meeting
+        including the ones where nothing was wrong.
+        """
+        if self.audio_only or not self.recording_with_audio or self.ffmpeg_proc is None:
+            return
+        if self.ffmpeg_proc.poll() is None:
+            return
+        logger.error(f"FFmpeg would not run with an audio input, so this meeting is being recorded silently from here on. FFmpeg said: {self.ffmpeg_output() or '(nothing)'}")
+        self._start_ffmpeg(self.display_var, with_audio=False)
+
+    def _start_ffmpeg(self, display_var, with_audio):
+        self.recording_with_audio = with_audio
         if self.audio_only:
             # FFmpeg command for audio-only recording to MP3
             ffmpeg_cmd = [
                 "ffmpeg",
                 "-y",  # Overwrite output file without asking
+                # Its stderr is read back and logged when something goes wrong, and a
+                # 30-line build banner in front of a one-line error is what turns that
+                # log into nothing: the useful part is what gets cut when a line is
+                # truncated. Same pair DebugScreenRecorder already uses.
+                "-hide_banner",
+                "-loglevel",
+                "error",
                 "-thread_queue_size",
                 "4096",
                 "-f",
@@ -59,10 +104,18 @@ class ScreenAndAudioRecorder:
                 self.file_location,
             ]
         else:
-            ffmpeg_cmd = ["ffmpeg", "-y", "-thread_queue_size", "256", "-framerate", "30", "-video_size", f"{self.screen_dimensions[0]}x{self.screen_dimensions[1]}", "-f", "x11grab", "-draw_mouse", "0", "-probesize", "32", "-i", display_var, "-thread_queue_size", "4096", "-f", "alsa", "-i", "default", "-vf", f"crop={self.recording_dimensions[0]}:{self.recording_dimensions[1]}:10:10", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "30", "-c:a", "aac", "-strict", "experimental", "-b:a", "128k", self.file_location]
+            ffmpeg_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-thread_queue_size", "256", "-framerate", "30", "-video_size", f"{self.screen_dimensions[0]}x{self.screen_dimensions[1]}", "-f", "x11grab", "-draw_mouse", "0", "-probesize", "32", "-i", display_var]
+            if with_audio:
+                ffmpeg_cmd += ["-thread_queue_size", "4096", "-f", "alsa", "-i", "default"]
+            ffmpeg_cmd += ["-vf", f"crop={self.recording_dimensions[0]}:{self.recording_dimensions[1]}:10:10", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "30"]
+            ffmpeg_cmd += ["-c:a", "aac", "-strict", "experimental", "-b:a", "128k"] if with_audio else ["-an"]
+            ffmpeg_cmd += [self.file_location]
 
         logger.info(f"Starting FFmpeg command: {' '.join(ffmpeg_cmd)}")
         self.ffmpeg_command = " ".join(ffmpeg_cmd)
+        # Closed first: the retry without audio opens the same path again, and the
+        # handle from the attempt that just died would otherwise be left dangling.
+        self._close_ffmpeg_log()
         self.ffmpeg_log_file = self._open_ffmpeg_log()
         self.ffmpeg_proc = subprocess.Popen(
             ffmpeg_cmd,
@@ -85,7 +138,12 @@ class ScreenAndAudioRecorder:
             return None
 
     def ffmpeg_output(self):
-        """The tail of what FFmpeg said, or "" when it said nothing we can read."""
+        """The last few lines of what FFmpeg said, or "" when it said nothing readable.
+
+        Joined with " | " rather than newlines: this goes into one log record, and a
+        multi-line one is split across entries by most log viewers, which is how the
+        one line that matters ends up somewhere other than the error it belongs to.
+        """
         if not self.ffmpeg_log_location:
             return ""
         if self.ffmpeg_log_file is not None:
@@ -95,9 +153,11 @@ class ScreenAndAudioRecorder:
                 pass
         try:
             with open(self.ffmpeg_log_location, "rb") as log:
-                return log.read().decode("utf-8", "replace").strip()[-FFMPEG_ERROR_TAIL_CHARS:]
+                said = log.read().decode("utf-8", "replace")
         except OSError:
             return ""
+        lines = [line.strip() for line in said.splitlines() if line.strip()]
+        return " | ".join(lines[-FFMPEG_ERROR_TAIL_LINES:])[-FFMPEG_ERROR_TAIL_CHARS:]
 
     def _close_ffmpeg_log(self):
         if self.ffmpeg_log_file is None:
@@ -235,12 +295,10 @@ class ScreenAndAudioRecorder:
         if not os.path.exists(input_path):
             # The empty file is still written, because the upload path downstream is
             # built on there being one - but at ERROR and saying what FFmpeg said,
-            # rather than the "creating empty file" note this used to be. What must
-            # not happen is the *recording row* naming it: an empty placeholder
-            # advertised as a recording is how a customer-facing "watch this meeting
-            # back" button came to open a zero-byte mp4. See
-            # BotController.cleanup, which no longer saves a file it has just been
-            # told is empty.
+            # rather than the "creating empty file" note this used to be. That note
+            # was the only trace of the failure that put a zero-byte mp4 behind a
+            # customer-facing "watch this meeting back" button, and it named no cause
+            # at all.
             logger.error(f"FFmpeg never wrote {input_path}, so this meeting recorded nothing and an empty placeholder is going up in its place. Command was: {self.ffmpeg_command}. FFmpeg said: {self.ffmpeg_output() or '(nothing)'}")
             with open(input_path, "wb"):
                 pass  # Create empty file

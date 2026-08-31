@@ -47,7 +47,15 @@ class FakeFfmpeg:
     def terminate(self):
         self.terminated = True
 
-    def wait(self):
+    def wait(self, timeout=None):
+        """Popen's contract, including the half `_ffmpeg_died_at_once` depends on.
+
+        A timeout is how the recorder asks "are you still alive?", and a process that
+        is still running answers by making it expire - the real Popen raises here, and
+        a fake that returned instead would report every healthy FFmpeg as dead.
+        """
+        if self.returncode is None and timeout is not None:
+            raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=timeout)
         self.returncode = self._final_returncode
         return self.returncode
 
@@ -97,9 +105,6 @@ class ScreenAndAudioRecorderTestCase(SimpleTestCase):
         """The regression. The placeholder is still written - the upload path is built
         on there being a file - but "creating empty file" at INFO was the only trace
         that anything had gone wrong, and it named no cause at all.
-
-        What must not follow from it is a recording row pointing at those zero bytes;
-        that half is BotController's, and is why it now asks before saving the name.
         """
         self.start_with(FakeFfmpeg(returncode=1, said=b"Cannot open audio device\n"))
         self.recorder.stop_recording()
@@ -133,3 +138,99 @@ class ScreenAndAudioRecorderTestCase(SimpleTestCase):
     def test_a_bot_recording_nothing_at_all_still_cleans_up(self):
         """``file_location`` is None when the pipeline records neither audio nor video."""
         ScreenAndAudioRecorder(None, RECORDING_DIMENSIONS, audio_only=False).cleanup()
+
+    def test_the_reason_survives_a_log_line_that_gets_truncated(self):
+        """Fails against the first attempt, which logged a 2000-character tail.
+
+        FFmpeg opens with a thirty-line build banner, the platform carrying the log
+        truncates a long record, and what survived the first real failure was
+        `--enable-libx264 --enable-shared` - the flags, with the error cut off. So the
+        banner is off at the source and only the last few lines are carried, joined
+        into one record rather than split across several.
+        """
+        self.start_with(FakeFfmpeg(returncode=1, said=b"[x11grab] Cannot open display :0\n: Input/output error\n"))
+
+        self.assertEqual(
+            self.recorder.ffmpeg_output(),
+            "[x11grab] Cannot open display :0 | : Input/output error",
+        )
+
+    def test_the_banner_is_turned_off_at_the_source(self):
+        self.start_with(FakeFfmpeg(returncode=0, still_running=True))
+
+        self.assertIn("-hide_banner", self.recorder.ffmpeg_command)
+        self.assertIn("-loglevel error", self.recorder.ffmpeg_command)
+
+    def test_an_audio_device_that_will_not_open_costs_the_sound_not_the_recording(self):
+        """The bug this file was opened for, and the reason nothing was ever recorded.
+
+        FFmpeg takes both inputs in one process, so an ALSA device that will not open
+        takes the *video* down with it: no file, no recording, no explanation. The
+        container this runs in is known to have no capture device - `webpage_streamer`
+        has carried a no-sound-card path for exactly this reason - and this was the one
+        place that asked for audio with no fallback. Fails against that: the recorder
+        started once, died, and was never looked at again.
+        """
+        started = []
+
+        def fake_popen(command, stdout=None, stderr=None):
+            started.append(command)
+            if "alsa" in command:
+                ffmpeg = FakeFfmpeg(returncode=1, said=b"[alsa @ 0x1] cannot open audio device default\n")
+                ffmpeg.write_stderr_to(stderr)
+                return ffmpeg
+            return FakeFfmpeg(returncode=0, still_running=True)
+
+        with patch.object(subprocess, "Popen", side_effect=fake_popen):
+            with self.assertLogs("bots.bot_controller.screen_and_audio_recorder", level="ERROR") as logs:
+                self.recorder.start_recording(":0")
+
+        self.assertEqual(len(started), 2, "the recorder gave up instead of retrying without audio")
+        self.assertIn("alsa", started[0])
+        self.assertNotIn("alsa", started[1])
+        self.assertIn("-an", started[1])
+        self.assertIsNone(self.recorder.ffmpeg_proc.poll(), "the retry is what records the meeting")
+        said = "\n".join(logs.output)
+        self.assertIn("recorded silently", said)
+        self.assertIn("cannot open audio device", said)
+
+    def test_a_recorder_whose_audio_opens_is_left_alone(self):
+        """One process, one attempt: the fallback must cost nothing where audio works."""
+        started = []
+
+        def fake_popen(command, stdout=None, stderr=None):
+            started.append(command)
+            return FakeFfmpeg(returncode=0, still_running=True)
+
+        with patch.object(subprocess, "Popen", side_effect=fake_popen):
+            self.recorder.start_recording(":0")
+
+        self.assertEqual(len(started), 1)
+        self.assertIn("alsa", started[0])
+
+    def test_an_audio_only_recording_has_nothing_to_fall_back_to(self):
+        """Dropping the audio from an audio recording leaves no recording at all."""
+        started = []
+
+        def fake_popen(command, stdout=None, stderr=None):
+            started.append(command)
+            return FakeFfmpeg(returncode=1, said=b"cannot open audio device default\n")
+
+        recorder = ScreenAndAudioRecorder(self.file_location, RECORDING_DIMENSIONS, audio_only=True)
+        with patch.object(subprocess, "Popen", side_effect=fake_popen):
+            recorder.start_recording(":0")
+            recorder.restart_without_audio_if_ffmpeg_died()
+
+        self.assertEqual(len(started), 1, "an audio-only recorder retried without audio")
+
+    def test_the_meeting_where_nothing_is_wrong_pays_nothing(self):
+        """The fallback must not sit and watch a healthy FFmpeg.
+
+        `media_sending_enable_timestamp_ms` is taken the instant `start_recording`
+        returns, becomes the recording's `first_buffer_timestamp_ms`, and every
+        utterance is aligned against it - so a wait here would shift the whole
+        transcript by however long it lasted. Hence the check lives on the main loop.
+        """
+        with patch.object(subprocess, "Popen", side_effect=lambda *a, **k: FakeFfmpeg(returncode=0, still_running=True)):
+            with patch.object(FakeFfmpeg, "wait", side_effect=AssertionError("start_recording waited on FFmpeg")):
+                self.recorder.start_recording(":0")
