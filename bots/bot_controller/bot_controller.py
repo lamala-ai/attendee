@@ -1553,6 +1553,10 @@ class BotController:
                 self.screen_and_audio_recorder.degrade_recording_if_file_size_exceeded(
                     max_file_size_bytes=settings.BOT_RECORDING_VIDEO_DEGRADE_THRESHOLD_BYTES,
                 )
+                # And pick the recording back up if an audio device it could not open
+                # took FFmpeg down with it. Asked here rather than waited for at the
+                # start, so the meeting where nothing is wrong pays nothing.
+                self.screen_and_audio_recorder.restart_without_audio_if_ffmpeg_died()
 
             # Process completed audio chunk uploads
             if self.audio_chunk_uploader:

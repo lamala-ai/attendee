@@ -219,5 +219,18 @@ class ScreenAndAudioRecorderTestCase(SimpleTestCase):
         recorder = ScreenAndAudioRecorder(self.file_location, RECORDING_DIMENSIONS, audio_only=True)
         with patch.object(subprocess, "Popen", side_effect=fake_popen):
             recorder.start_recording(":0")
+            recorder.restart_without_audio_if_ffmpeg_died()
 
         self.assertEqual(len(started), 1, "an audio-only recorder retried without audio")
+
+    def test_the_meeting_where_nothing_is_wrong_pays_nothing(self):
+        """The fallback must not sit and watch a healthy FFmpeg.
+
+        `media_sending_enable_timestamp_ms` is taken the instant `start_recording`
+        returns, becomes the recording's `first_buffer_timestamp_ms`, and every
+        utterance is aligned against it - so a wait here would shift the whole
+        transcript by however long it lasted. Hence the check lives on the main loop.
+        """
+        with patch.object(subprocess, "Popen", side_effect=lambda *a, **k: FakeFfmpeg(returncode=0, still_running=True)):
+            with patch.object(FakeFfmpeg, "wait", side_effect=AssertionError("start_recording waited on FFmpeg")):
+                self.recorder.start_recording(":0")
