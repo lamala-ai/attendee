@@ -700,30 +700,26 @@ class BotController:
             logger.info("Telling websocket client manager to cleanup...")
             self.websocket_client_manager.cleanup()
 
-        if self.get_recording_file_location() and not self.has_recording_worth_uploading():
-            # Nothing was recorded - see ScreenAndAudioRecorder.cleanup, which now says
-            # in the log why. Uploading the zero bytes anyway is what put an unplayable
-            # mp4 behind a customer-facing "watch this meeting back" button, and left
-            # the recording row looking like a success. Left unset, the API answers
-            # "no recording file found for bot", which is the truth.
-            logger.error(f"There is no recording to upload for this bot - {self.get_recording_file_location()} is missing or empty. Nothing will be stored for it.")
-            # The upload is what normally clears /tmp, and every bot in this container
-            # shares it. An empty file nobody will ever send is still a leftover.
-            try:
-                os.remove(self.get_recording_file_location())
-            except OSError:
-                pass
-        elif self.get_recording_file_location():
+        if self.get_recording_file_location():
             self.upload_recording_to_external_media_storage_if_enabled()
 
             logger.info("Telling file uploader to upload recording file...")
+            # Asked before the upload, which deletes the local file on its way out.
+            recording_has_content = self.has_recording_worth_uploading()
             file_uploader = self.get_file_uploader()
             file_uploader.upload_file(self.get_recording_file_location())
             file_uploader.wait_for_upload()
             logger.info("File uploader finished uploading file")
             file_uploader.delete_file(self.get_recording_file_location())
             logger.info("File uploader deleted file from local filesystem")
-            self.recording_file_saved(file_uploader.filename)
+            if recording_has_content:
+                self.recording_file_saved(file_uploader.filename)
+            else:
+                # The recording row keeps no file, so the API answers "no recording
+                # file found for bot" - which is true. Naming the file anyway is what
+                # put an unplayable zero-byte mp4 behind a customer-facing "watch this
+                # meeting back" button, with every log line around it saying success.
+                logger.error(f"Nothing was recorded for this bot - {self.get_recording_file_location()} was empty, so no recording will be offered for it. ScreenAndAudioRecorder's own log says why.")
 
         if self.bot_in_db.create_debug_recording():
             self.save_debug_recording()

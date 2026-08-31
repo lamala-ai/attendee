@@ -233,13 +233,17 @@ class ScreenAndAudioRecorder:
 
         # Check if input file exists
         if not os.path.exists(input_path):
-            # An empty file used to be written here so the upload path downstream had
-            # something to send, and that is exactly how a recorder that never ran
-            # reached a customer as a playable-looking mp4 of zero bytes. It is left
-            # missing now: `has_recording_worth_uploading` skips the upload, the
-            # recording row keeps no file, and the API's own "no recording file found"
-            # is the honest answer to what happened.
-            logger.error(f"FFmpeg never wrote {input_path}, so this meeting recorded nothing. Command was: {self.ffmpeg_command}. FFmpeg said: {self.ffmpeg_output() or '(nothing)'}")
+            # The empty file is still written, because the upload path downstream is
+            # built on there being one - but at ERROR and saying what FFmpeg said,
+            # rather than the "creating empty file" note this used to be. What must
+            # not happen is the *recording row* naming it: an empty placeholder
+            # advertised as a recording is how a customer-facing "watch this meeting
+            # back" button came to open a zero-byte mp4. See
+            # BotController.cleanup, which no longer saves a file it has just been
+            # told is empty.
+            logger.error(f"FFmpeg never wrote {input_path}, so this meeting recorded nothing and an empty placeholder is going up in its place. Command was: {self.ffmpeg_command}. FFmpeg said: {self.ffmpeg_output() or '(nothing)'}")
+            with open(input_path, "wb"):
+                pass  # Create empty file
             self._close_ffmpeg_log()
             self.discard_ffmpeg_log()
             return
