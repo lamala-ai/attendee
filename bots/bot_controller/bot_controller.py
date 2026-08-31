@@ -700,7 +700,20 @@ class BotController:
             logger.info("Telling websocket client manager to cleanup...")
             self.websocket_client_manager.cleanup()
 
-        if self.get_recording_file_location():
+        if self.get_recording_file_location() and not self.has_recording_worth_uploading():
+            # Nothing was recorded - see ScreenAndAudioRecorder.cleanup, which now says
+            # in the log why. Uploading the zero bytes anyway is what put an unplayable
+            # mp4 behind a customer-facing "watch this meeting back" button, and left
+            # the recording row looking like a success. Left unset, the API answers
+            # "no recording file found for bot", which is the truth.
+            logger.error(f"There is no recording to upload for this bot - {self.get_recording_file_location()} is missing or empty. Nothing will be stored for it.")
+            # The upload is what normally clears /tmp, and every bot in this container
+            # shares it. An empty file nobody will ever send is still a leftover.
+            try:
+                os.remove(self.get_recording_file_location())
+            except OSError:
+                pass
+        elif self.get_recording_file_location():
             self.upload_recording_to_external_media_storage_if_enabled()
 
             logger.info("Telling file uploader to upload recording file...")
@@ -804,6 +817,25 @@ class BotController:
             return None
         else:
             return os.path.join(self.get_recording_storage_directory(), self.get_recording_filename())
+
+    def has_recording_worth_uploading(self):
+        """Whether a real recording is sitting where one is expected.
+
+        Asked of the path rather than of whatever produced it, because two things write
+        it - the screen recorder for browser bots, the gstreamer pipeline for the Zoom
+        SDK - and both can end a meeting having written nothing.
+
+        Zero bytes is not a recording. Nothing can play it and nothing can transcribe
+        it, so uploading it only converts "we recorded nothing" into a row that claims
+        a file and a button that opens an empty video.
+        """
+        location = self.get_recording_file_location()
+        if not location:
+            return False
+        try:
+            return os.path.getsize(location) > 0
+        except OSError:
+            return False
 
     def get_recording_storage_directory(self):
         if self.bot_in_db.reserve_additional_storage():
