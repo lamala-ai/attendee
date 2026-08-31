@@ -704,13 +704,22 @@ class BotController:
             self.upload_recording_to_external_media_storage_if_enabled()
 
             logger.info("Telling file uploader to upload recording file...")
+            # Asked before the upload, which deletes the local file on its way out.
+            recording_has_content = self.has_recording_worth_uploading()
             file_uploader = self.get_file_uploader()
             file_uploader.upload_file(self.get_recording_file_location())
             file_uploader.wait_for_upload()
             logger.info("File uploader finished uploading file")
             file_uploader.delete_file(self.get_recording_file_location())
             logger.info("File uploader deleted file from local filesystem")
-            self.recording_file_saved(file_uploader.filename)
+            if recording_has_content:
+                self.recording_file_saved(file_uploader.filename)
+            else:
+                # The recording row keeps no file, so the API answers "no recording
+                # file found for bot" - which is true. Naming the file anyway is what
+                # put an unplayable zero-byte mp4 behind a customer-facing "watch this
+                # meeting back" button, with every log line around it saying success.
+                logger.error(f"Nothing was recorded for this bot - {self.get_recording_file_location()} was empty, so no recording will be offered for it. ScreenAndAudioRecorder's own log says why.")
 
         if self.bot_in_db.create_debug_recording():
             self.save_debug_recording()
@@ -804,6 +813,25 @@ class BotController:
             return None
         else:
             return os.path.join(self.get_recording_storage_directory(), self.get_recording_filename())
+
+    def has_recording_worth_uploading(self):
+        """Whether a real recording is sitting where one is expected.
+
+        Asked of the path rather than of whatever produced it, because two things write
+        it - the screen recorder for browser bots, the gstreamer pipeline for the Zoom
+        SDK - and both can end a meeting having written nothing.
+
+        Zero bytes is not a recording. Nothing can play it and nothing can transcribe
+        it, so uploading it only converts "we recorded nothing" into a row that claims
+        a file and a button that opens an empty video.
+        """
+        location = self.get_recording_file_location()
+        if not location:
+            return False
+        try:
+            return os.path.getsize(location) > 0
+        except OSError:
+            return False
 
     def get_recording_storage_directory(self):
         if self.bot_in_db.reserve_additional_storage():
