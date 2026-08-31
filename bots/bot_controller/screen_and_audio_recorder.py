@@ -5,10 +5,14 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# How much of ffmpeg's own complaint to put in the log when it dies. Its startup errors
-# are one line ("Cannot open audio device", "Invalid argument"); the tail is what says
-# why it stopped, and the banner above it says nothing worth carrying.
-FFMPEG_ERROR_TAIL_CHARS = 2000
+# How much of FFmpeg's own complaint to put in the log when it dies. Its startup errors
+# are a line or two ("Cannot open audio device", "Invalid argument"), and what carries
+# them has a line length of its own: the first attempt logged a 2000-character tail and
+# the hosting platform truncated it, so what survived was build flags and the error was
+# the part that got cut. Last few lines, tightly capped, and the banner is turned off at
+# the source.
+FFMPEG_ERROR_TAIL_LINES = 6
+FFMPEG_ERROR_TAIL_CHARS = 600
 
 
 class ScreenAndAudioRecorder:
@@ -42,6 +46,13 @@ class ScreenAndAudioRecorder:
             ffmpeg_cmd = [
                 "ffmpeg",
                 "-y",  # Overwrite output file without asking
+                # Its stderr is read back and logged when something goes wrong, and a
+                # 30-line build banner in front of a one-line error is what turns that
+                # log into nothing: the useful part is what gets cut when a line is
+                # truncated. Same pair DebugScreenRecorder already uses.
+                "-hide_banner",
+                "-loglevel",
+                "error",
                 "-thread_queue_size",
                 "4096",
                 "-f",
@@ -59,7 +70,7 @@ class ScreenAndAudioRecorder:
                 self.file_location,
             ]
         else:
-            ffmpeg_cmd = ["ffmpeg", "-y", "-thread_queue_size", "256", "-framerate", "30", "-video_size", f"{self.screen_dimensions[0]}x{self.screen_dimensions[1]}", "-f", "x11grab", "-draw_mouse", "0", "-probesize", "32", "-i", display_var, "-thread_queue_size", "4096", "-f", "alsa", "-i", "default", "-vf", f"crop={self.recording_dimensions[0]}:{self.recording_dimensions[1]}:10:10", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "30", "-c:a", "aac", "-strict", "experimental", "-b:a", "128k", self.file_location]
+            ffmpeg_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-thread_queue_size", "256", "-framerate", "30", "-video_size", f"{self.screen_dimensions[0]}x{self.screen_dimensions[1]}", "-f", "x11grab", "-draw_mouse", "0", "-probesize", "32", "-i", display_var, "-thread_queue_size", "4096", "-f", "alsa", "-i", "default", "-vf", f"crop={self.recording_dimensions[0]}:{self.recording_dimensions[1]}:10:10", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "30", "-c:a", "aac", "-strict", "experimental", "-b:a", "128k", self.file_location]
 
         logger.info(f"Starting FFmpeg command: {' '.join(ffmpeg_cmd)}")
         self.ffmpeg_command = " ".join(ffmpeg_cmd)
@@ -85,7 +96,12 @@ class ScreenAndAudioRecorder:
             return None
 
     def ffmpeg_output(self):
-        """The tail of what FFmpeg said, or "" when it said nothing we can read."""
+        """The last few lines of what FFmpeg said, or "" when it said nothing readable.
+
+        Joined with " | " rather than newlines: this goes into one log record, and a
+        multi-line one is split across entries by most log viewers, which is how the
+        one line that matters ends up somewhere other than the error it belongs to.
+        """
         if not self.ffmpeg_log_location:
             return ""
         if self.ffmpeg_log_file is not None:
@@ -95,9 +111,11 @@ class ScreenAndAudioRecorder:
                 pass
         try:
             with open(self.ffmpeg_log_location, "rb") as log:
-                return log.read().decode("utf-8", "replace").strip()[-FFMPEG_ERROR_TAIL_CHARS:]
+                said = log.read().decode("utf-8", "replace")
         except OSError:
             return ""
+        lines = [line.strip() for line in said.splitlines() if line.strip()]
+        return " | ".join(lines[-FFMPEG_ERROR_TAIL_LINES:])[-FFMPEG_ERROR_TAIL_CHARS:]
 
     def _close_ffmpeg_log(self):
         if self.ffmpeg_log_file is None:

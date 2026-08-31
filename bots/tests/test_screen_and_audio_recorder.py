@@ -130,3 +130,25 @@ class ScreenAndAudioRecorderTestCase(SimpleTestCase):
     def test_a_bot_recording_nothing_at_all_still_cleans_up(self):
         """``file_location`` is None when the pipeline records neither audio nor video."""
         ScreenAndAudioRecorder(None, RECORDING_DIMENSIONS, audio_only=False).cleanup()
+
+    def test_the_reason_survives_a_log_line_that_gets_truncated(self):
+        """Fails against the first attempt, which logged a 2000-character tail.
+
+        FFmpeg opens with a thirty-line build banner, the platform carrying the log
+        truncates a long record, and what survived the first real failure was
+        `--enable-libx264 --enable-shared` - the flags, with the error cut off. So the
+        banner is off at the source and only the last few lines are carried, joined
+        into one record rather than split across several.
+        """
+        self.start_with(FakeFfmpeg(returncode=1, said=b"[x11grab] Cannot open display :0\n: Input/output error\n"))
+
+        self.assertEqual(
+            self.recorder.ffmpeg_output(),
+            "[x11grab] Cannot open display :0 | : Input/output error",
+        )
+
+    def test_the_banner_is_turned_off_at_the_source(self):
+        self.start_with(FakeFfmpeg(returncode=0, still_running=True))
+
+        self.assertIn("-hide_banner", self.recorder.ffmpeg_command)
+        self.assertIn("-loglevel error", self.recorder.ffmpeg_command)
