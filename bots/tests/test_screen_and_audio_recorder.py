@@ -47,7 +47,15 @@ class FakeFfmpeg:
     def terminate(self):
         self.terminated = True
 
-    def wait(self):
+    def wait(self, timeout=None):
+        """Popen's contract, including the half `_ffmpeg_died_at_once` depends on.
+
+        A timeout is how the recorder asks "are you still alive?", and a process that
+        is still running answers by making it expire - the real Popen raises here, and
+        a fake that returned instead would report every healthy FFmpeg as dead.
+        """
+        if self.returncode is None and timeout is not None:
+            raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=timeout)
         self.returncode = self._final_returncode
         return self.returncode
 
