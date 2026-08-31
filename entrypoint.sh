@@ -36,7 +36,12 @@ mkdir -p "$PULSE_RUNTIME_PATH"
 chmod 700 "$XDG_RUNTIME_DIR" || true
 
 
-# Make ALSA 'default' point at Pulse
+# Make ALSA 'default' point at Pulse.
+#
+# The copy that actually gets read is /etc/asound.conf, baked into the image: HOME is
+# not set here, so ALSA's getenv("HOME") lookup never finds the file below however
+# carefully it is written. This one stays as a fallback for a container started without
+# that image layer, and because it costs nothing.
 HOME_DIR="${HOME:-/home/$(id -un)}"
 mkdir -p "$HOME_DIR"
 cat > "$HOME_DIR/.asoundrc" <<'EOF'

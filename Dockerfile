@@ -129,6 +129,21 @@ RUN mkdir -p "$cwd/staticfiles" && chown -R app:app "$cwd/staticfiles"
 RUN mkdir -p /etc/opt/chrome/policies/managed \
   && ln -s /tmp/attendee-chrome-policies.json /etc/opt/chrome/policies/managed/attendee-chrome-policies.json
 
+# Point ALSA's "default" PCM at PulseAudio for every process in the container.
+#
+# entrypoint.sh already writes this, into `~/.asoundrc` - and nothing reads it. HOME is
+# not set anywhere in this image, so the entrypoint falls back to /home/$(id -un) and
+# writes a real file, while the ALSA library inside FFmpeg looks up `~` through
+# getenv("HOME"), finds nothing, and never opens it. The symptom is one line:
+#
+#     ALSA lib pcm.c:2664:(snd_pcm_open_noupdate) Unknown PCM default
+#
+# and it cost every meeting its recording - FFmpeg takes the screen and the microphone
+# as two inputs of one process, so an audio device it cannot open kills the video too.
+# /etc/asound.conf is read whatever HOME says, and is written here as root because the
+# entrypoint runs as `app` and could not create it.
+RUN printf 'pcm.!default { type pulse }\nctl.!default { type pulse }\n' > /etc/asound.conf
+
 # Switch to non-root AFTER copies to avoid permission flakiness
 USER app
 
