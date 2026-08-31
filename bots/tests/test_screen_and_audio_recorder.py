@@ -182,8 +182,10 @@ class ScreenAndAudioRecorderTestCase(SimpleTestCase):
             return FakeFfmpeg(returncode=0, still_running=True)
 
         with patch.object(subprocess, "Popen", side_effect=fake_popen):
+            self.recorder.start_recording(":0")
+            self.assertEqual(len(started), 1, "start_recording waited for FFmpeg instead of returning")
             with self.assertLogs("bots.bot_controller.screen_and_audio_recorder", level="ERROR") as logs:
-                self.recorder.start_recording(":0")
+                self.recorder.restart_without_audio_if_ffmpeg_died()
 
         self.assertEqual(len(started), 2, "the recorder gave up instead of retrying without audio")
         self.assertIn("alsa", started[0])
@@ -204,6 +206,8 @@ class ScreenAndAudioRecorderTestCase(SimpleTestCase):
 
         with patch.object(subprocess, "Popen", side_effect=fake_popen):
             self.recorder.start_recording(":0")
+            for _ in range(3):
+                self.recorder.restart_without_audio_if_ffmpeg_died()
 
         self.assertEqual(len(started), 1)
         self.assertIn("alsa", started[0])
