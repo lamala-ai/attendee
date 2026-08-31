@@ -152,3 +152,64 @@ class ScreenAndAudioRecorderTestCase(SimpleTestCase):
 
         self.assertIn("-hide_banner", self.recorder.ffmpeg_command)
         self.assertIn("-loglevel error", self.recorder.ffmpeg_command)
+
+    def test_an_audio_device_that_will_not_open_costs_the_sound_not_the_recording(self):
+        """The bug this file was opened for, and the reason nothing was ever recorded.
+
+        FFmpeg takes both inputs in one process, so an ALSA device that will not open
+        takes the *video* down with it: no file, no recording, no explanation. The
+        container this runs in is known to have no capture device - `webpage_streamer`
+        has carried a no-sound-card path for exactly this reason - and this was the one
+        place that asked for audio with no fallback. Fails against that: the recorder
+        started once, died, and was never looked at again.
+        """
+        started = []
+
+        def fake_popen(command, stdout=None, stderr=None):
+            started.append(command)
+            if "alsa" in command:
+                ffmpeg = FakeFfmpeg(returncode=1, said=b"[alsa @ 0x1] cannot open audio device default\n")
+                ffmpeg.write_stderr_to(stderr)
+                return ffmpeg
+            return FakeFfmpeg(returncode=0, still_running=True)
+
+        with patch.object(subprocess, "Popen", side_effect=fake_popen):
+            with self.assertLogs("bots.bot_controller.screen_and_audio_recorder", level="ERROR") as logs:
+                self.recorder.start_recording(":0")
+
+        self.assertEqual(len(started), 2, "the recorder gave up instead of retrying without audio")
+        self.assertIn("alsa", started[0])
+        self.assertNotIn("alsa", started[1])
+        self.assertIn("-an", started[1])
+        self.assertIsNone(self.recorder.ffmpeg_proc.poll(), "the retry is what records the meeting")
+        said = "\n".join(logs.output)
+        self.assertIn("recorded silently", said)
+        self.assertIn("cannot open audio device", said)
+
+    def test_a_recorder_whose_audio_opens_is_left_alone(self):
+        """One process, one attempt: the fallback must cost nothing where audio works."""
+        started = []
+
+        def fake_popen(command, stdout=None, stderr=None):
+            started.append(command)
+            return FakeFfmpeg(returncode=0, still_running=True)
+
+        with patch.object(subprocess, "Popen", side_effect=fake_popen):
+            self.recorder.start_recording(":0")
+
+        self.assertEqual(len(started), 1)
+        self.assertIn("alsa", started[0])
+
+    def test_an_audio_only_recording_has_nothing_to_fall_back_to(self):
+        """Dropping the audio from an audio recording leaves no recording at all."""
+        started = []
+
+        def fake_popen(command, stdout=None, stderr=None):
+            started.append(command)
+            return FakeFfmpeg(returncode=1, said=b"cannot open audio device default\n")
+
+        recorder = ScreenAndAudioRecorder(self.file_location, RECORDING_DIMENSIONS, audio_only=True)
+        with patch.object(subprocess, "Popen", side_effect=fake_popen):
+            recorder.start_recording(":0")
+
+        self.assertEqual(len(started), 1, "an audio-only recorder retried without audio")

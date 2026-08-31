@@ -14,6 +14,11 @@ logger = logging.getLogger(__name__)
 FFMPEG_ERROR_TAIL_LINES = 6
 FFMPEG_ERROR_TAIL_CHARS = 600
 
+# How long to give FFmpeg to prove it opened its inputs. A device it cannot open is
+# refused at startup, well inside this; anything still running after it has everything
+# it asked for. Paid once per meeting, on a path that already sleeps 2s before it.
+FFMPEG_STARTUP_GRACE_SECONDS = 2.0
+
 
 class ScreenAndAudioRecorder:
     def __init__(self, file_location, recording_dimensions, audio_only):
@@ -41,6 +46,37 @@ class ScreenAndAudioRecorder:
     def start_recording(self, display_var):
         logger.info(f"Starting screen recorder for display {display_var} with dimensions {self.screen_dimensions} and file location {self.file_location}")
 
+        self._start_ffmpeg(display_var, with_audio=True)
+
+        # A screen recording that has to have sound is not a screen recording. FFmpeg
+        # takes both inputs in one process, so an ALSA device that will not open takes
+        # the *video* down with it and the meeting is left with no file at all - which
+        # is what was happening on every call here, invisibly, because the audio branch
+        # is the fragile half (see webpage_streamer, which has carried a no-sound-card
+        # path for exactly this reason) and nothing checked whether FFmpeg was still
+        # alive. Retried without it, so a container with no capture device records a
+        # silent screen instead of nothing.
+        if self.audio_only or not self._ffmpeg_died_at_once():
+            return
+        logger.error(f"FFmpeg would not start with an audio input, so this meeting is being recorded silently. FFmpeg said: {self.ffmpeg_output() or '(nothing)'}")
+        self._start_ffmpeg(display_var, with_audio=False)
+
+    def _ffmpeg_died_at_once(self):
+        """Whether FFmpeg gave up before it could have recorded anything.
+
+        A failing input device is refused at startup, so this is a short wait and not a
+        poll: an FFmpeg still running after it is one that opened everything it was
+        asked for, and every later failure is somebody else's to notice.
+        """
+        if self.ffmpeg_proc is None:
+            return True
+        try:
+            self.ffmpeg_proc.wait(timeout=FFMPEG_STARTUP_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
+    def _start_ffmpeg(self, display_var, with_audio):
         if self.audio_only:
             # FFmpeg command for audio-only recording to MP3
             ffmpeg_cmd = [
@@ -70,10 +106,18 @@ class ScreenAndAudioRecorder:
                 self.file_location,
             ]
         else:
-            ffmpeg_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-thread_queue_size", "256", "-framerate", "30", "-video_size", f"{self.screen_dimensions[0]}x{self.screen_dimensions[1]}", "-f", "x11grab", "-draw_mouse", "0", "-probesize", "32", "-i", display_var, "-thread_queue_size", "4096", "-f", "alsa", "-i", "default", "-vf", f"crop={self.recording_dimensions[0]}:{self.recording_dimensions[1]}:10:10", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "30", "-c:a", "aac", "-strict", "experimental", "-b:a", "128k", self.file_location]
+            ffmpeg_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-thread_queue_size", "256", "-framerate", "30", "-video_size", f"{self.screen_dimensions[0]}x{self.screen_dimensions[1]}", "-f", "x11grab", "-draw_mouse", "0", "-probesize", "32", "-i", display_var]
+            if with_audio:
+                ffmpeg_cmd += ["-thread_queue_size", "4096", "-f", "alsa", "-i", "default"]
+            ffmpeg_cmd += ["-vf", f"crop={self.recording_dimensions[0]}:{self.recording_dimensions[1]}:10:10", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "30"]
+            ffmpeg_cmd += ["-c:a", "aac", "-strict", "experimental", "-b:a", "128k"] if with_audio else ["-an"]
+            ffmpeg_cmd += [self.file_location]
 
         logger.info(f"Starting FFmpeg command: {' '.join(ffmpeg_cmd)}")
         self.ffmpeg_command = " ".join(ffmpeg_cmd)
+        # Closed first: the retry without audio opens the same path again, and the
+        # handle from the attempt that just died would otherwise be left dangling.
+        self._close_ffmpeg_log()
         self.ffmpeg_log_file = self._open_ffmpeg_log()
         self.ffmpeg_proc = subprocess.Popen(
             ffmpeg_cmd,
