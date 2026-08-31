@@ -704,22 +704,23 @@ class BotController:
             self.upload_recording_to_external_media_storage_if_enabled()
 
             logger.info("Telling file uploader to upload recording file...")
-            # Asked before the upload, which deletes the local file on its way out.
-            recording_has_content = self.has_recording_worth_uploading()
+            # Said, not acted on. Withholding the file name from the recording row is
+            # what the previous commit did, and `RecordingManager.terminate_recording`
+            # reads exactly that field: no file plus an intent to record means the
+            # recording is marked FAILED rather than COMPLETE. That is arguably the
+            # truthful state, but it is a change to what every customer of this backend
+            # sees in the API and in the events hanging off it - not something to slip
+            # in behind a logging fix. So the row is saved as it always was, and the
+            # empty recording is named here instead.
+            if not self.has_recording_worth_uploading():
+                logger.error(f"Nothing was recorded for this bot - {self.get_recording_file_location()} is empty, so what goes up is a placeholder rather than a meeting. ScreenAndAudioRecorder's own log says why.")
             file_uploader = self.get_file_uploader()
             file_uploader.upload_file(self.get_recording_file_location())
             file_uploader.wait_for_upload()
             logger.info("File uploader finished uploading file")
             file_uploader.delete_file(self.get_recording_file_location())
             logger.info("File uploader deleted file from local filesystem")
-            if recording_has_content:
-                self.recording_file_saved(file_uploader.filename)
-            else:
-                # The recording row keeps no file, so the API answers "no recording
-                # file found for bot" - which is true. Naming the file anyway is what
-                # put an unplayable zero-byte mp4 behind a customer-facing "watch this
-                # meeting back" button, with every log line around it saying success.
-                logger.error(f"Nothing was recorded for this bot - {self.get_recording_file_location()} was empty, so no recording will be offered for it. ScreenAndAudioRecorder's own log says why.")
+            self.recording_file_saved(file_uploader.filename)
 
         if self.bot_in_db.create_debug_recording():
             self.save_debug_recording()

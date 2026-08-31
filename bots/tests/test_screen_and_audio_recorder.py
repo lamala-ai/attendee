@@ -97,9 +97,6 @@ class ScreenAndAudioRecorderTestCase(SimpleTestCase):
         """The regression. The placeholder is still written - the upload path is built
         on there being a file - but "creating empty file" at INFO was the only trace
         that anything had gone wrong, and it named no cause at all.
-
-        What must not follow from it is a recording row pointing at those zero bytes;
-        that half is BotController's, and is why it now asks before saving the name.
         """
         self.start_with(FakeFfmpeg(returncode=1, said=b"Cannot open audio device\n"))
         self.recorder.stop_recording()
