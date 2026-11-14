@@ -178,6 +178,17 @@ CELERY_RESULT_BACKEND = REDIS_URL_WITH_PARAMS
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
+
+# How many pool processes the worker runs. Celery's own default is one per CPU the machine
+# reports, which is a capacity figure on a host sized for the worker and a billing figure
+# on a shared one: on Railway the container reported enough CPUs for 48, and the worker
+# held 9.2 GB around the clock while running nothing (Nov 2026: 0.06 vCPU on average,
+# ~$94 a month of memory, nearly the whole bill). Off Kubernetes every bot runs as
+# one of these processes for the length of its meeting, so this is also how many meetings
+# one worker can be in at once - the next bot waits in the queue for a free slot rather
+# than failing. Raise it with the variable, or run another worker replica.
+CELERY_WORKER_CONCURRENCY = int(os.getenv("CELERY_WORKER_CONCURRENCY", "8"))
+
 CELERY_TASK_ROUTES = {
     "bots.tasks.process_utterance_task.process_utterance": {
         "queue": os.getenv("PROCESS_UTTERANCE_CELERY_QUEUE", "celery"),
