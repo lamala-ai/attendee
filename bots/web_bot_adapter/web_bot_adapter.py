@@ -33,6 +33,15 @@ from .ui_methods import UiAuthorizedUserNotInMeetingTimeoutExceededException, Ui
 
 logger = logging.getLogger(__name__)
 
+# How long to wait, off Kubernetes, after a platform has refused the bot five times in a
+# row, before trying again in the same process. On Kubernetes the answer is a new pod.
+BLOCKED_BY_PLATFORM_RETRY_WAIT_SECONDS = 15
+
+
+def bot_pods_can_be_recreated():
+    """Whether restart_bot_pod has anything to restart - true only on Kubernetes."""
+    return os.getenv("LAUNCH_BOT_METHOD") == "kubernetes"
+
 
 class WebBotAdapter(BotAdapter):
     def __init__(
@@ -834,10 +843,23 @@ class WebBotAdapter(BotAdapter):
                 num_expected_exceptions += 1
                 if num_expected_exceptions % 5 == 0:
                     num_retries += 1
-                    logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is expected and {num_expected_exceptions} expected exceptions have occurred, so incrementing num_retries. This usually indicates that the meeting has not started yet, so we will wait for the configured amount of time which is 180 seconds before retrying")
-                    # We're going to start a new pod to see if that fixes the issue
-                    self.send_message_callback({"message": self.Messages.BLOCKED_BY_PLATFORM_REPEATEDLY})
-                    return
+                    if bot_pods_can_be_recreated():
+                        logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is expected and {num_expected_exceptions} expected exceptions have occurred, so incrementing num_retries. This usually indicates that the meeting has not started yet, so we will wait for the configured amount of time which is 180 seconds before retrying")
+                        # We're going to start a new pod to see if that fixes the issue
+                        self.send_message_callback({"message": self.Messages.BLOCKED_BY_PLATFORM_REPEATEDLY})
+                        return
+
+                    # Off Kubernetes there is no pod to recreate: restart_bot_pod raises on a
+                    # missing kube-config and the bot is simply gone, after ten seconds of
+                    # trying, from a meeting that would have let it in on the next attempt
+                    # (Google Meet's "You can't join this video call" comes and goes - bot 205
+                    # got through on its second try on 14 Nov 2026, bot 206 was refused five
+                    # times in ten seconds and quit). So wait, then keep going in this process
+                    # with a fresh browser; the num_retries limit above still ends it.
+                    if self.left_meeting or self.cleaned_up:
+                        return
+                    logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is expected and {num_expected_exceptions} expected exceptions have occurred. There is no pod to recreate off Kubernetes, so waiting {BLOCKED_BY_PLATFORM_RETRY_WAIT_SECONDS} seconds and trying again with a fresh browser (retry {num_retries} of {max_retries})")
+                    time.sleep(BLOCKED_BY_PLATFORM_RETRY_WAIT_SECONDS)
                 else:
                     logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is expected so not incrementing num_retries, but {num_expected_exceptions} expected exceptions have occurred")
 
